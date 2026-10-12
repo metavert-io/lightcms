@@ -238,6 +238,18 @@ func main() {
 
 	csrfMiddleware := middleware.CSRFProtect(csrfKey, cfg.SecureCookies)
 
+	// gorilla/csrf v1.7.x defaults the assumed request scheme to "https" for
+	// Origin/Referer checks. On plaintext HTTP the browser-sent Origin
+	// (e.g. http://localhost:8082) won't match, so flag requests as plaintext.
+	if !cfg.SecureCookies {
+		inner := csrfMiddleware
+		csrfMiddleware = func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				inner(next).ServeHTTP(w, csrf.PlaintextHTTPRequest(r))
+			})
+		}
+	}
+
 	// Admin routes (under /cm)
 	admin := r.PathPrefix("/cm").Subrouter()
 	admin.Use(csrfMiddleware)
