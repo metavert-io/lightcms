@@ -1,0 +1,109 @@
+# Threat model, maintained with the Security Steward (format steward-tm/0.1).
+# IDs are permanent: retire a threat instead of deleting it, and never reuse a number.
+schema: steward-tm/0.1
+project: metavert-io/lightcms
+prefix: LC
+model_version: 1
+reviewed_at_commit: 81707877bb8d29dd74cf79c8b919a91c0a3aa637
+refs:
+  asi: "2026"
+  asvs: 5.0.0
+  llm: "2025"
+  mcp_spec: "2026-07-28"
+  stride: default
+summary: 'A multi-user Go and MongoDB CMS (metavert.io): an admin UI, a REST API, an authenticated MCP server with OAuth 2.1 for connectors, a public read-only MCP endpoint, a public chat widget and search. It also publishes an MCP container image.'
+components:
+  - id: C1
+    name: Admin UI (/cm)
+    kind: client
+    exposure: internet
+  - id: C2
+    name: REST API (/api/v1)
+    kind: service
+    exposure: internet
+  - id: C3
+    name: Authenticated MCP server (/mcp)
+    kind: service
+    exposure: internet
+  - id: C4
+    name: Public MCP endpoint (/mcp-public, read tools)
+    kind: service
+    exposure: internet
+  - id: C5
+    name: OAuth 2.1 server for MCP connectors
+    kind: service
+    exposure: internet
+  - id: C6
+    name: Public chat widget
+    kind: service
+    exposure: internet
+  - id: C7
+    name: Uploads and assets
+    kind: data
+    exposure: internet
+  - id: C8
+    name: System API key
+    kind: secret
+  - id: C9
+    name: MongoDB
+    kind: data
+    exposure: internal
+  - id: C10
+    name: Published MCP container image
+    kind: dependency
+    exposure: internet
+  - id: C11
+    name: Outbound fetches (webhooks, RSS, asset-from-URL, link checker)
+    kind: service
+boundaries:
+  - id: B1
+    name: Internet to the app
+    between:
+      - C1
+      - C2
+      - C3
+      - C4
+      - C5
+      - C6
+  - id: B2
+    name: Server to MongoDB
+    between:
+      - C2
+      - C3
+      - C9
+assumptions:
+  - id: A1
+    text: The app runs on Fly behind its proxy, which sets Fly-Client-IP.
+threats:
+  - id: T-LC-0001
+    title: Outbound fetches are pointed at internal or metadata addresses (SSRF)
+    targets:
+      - C11
+    tags:
+      - STRIDE:I
+      - STRIDE:T
+      - CWE-918
+      - ASVS:5.0.0:V12
+    status: mitigated
+    controls:
+      - M-LC-0001
+  - id: T-LC-0002
+    title: A client spoofs its address to dodge per-client limits
+    targets:
+      - C2
+      - C6
+    tags:
+      - STRIDE:S
+      - CWE-348
+    status: mitigated
+    controls:
+      - M-LC-0002
+controls:
+  - id: M-LC-0001
+    title: netguard SSRF guard on every outbound fetch
+    evidence:
+      - internal/netguard/netguard.go
+  - id: M-LC-0002
+    title: Client address taken from Fly-Client-IP
+    evidence:
+      - internal/middleware/apiauth.go
