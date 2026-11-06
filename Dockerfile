@@ -1,5 +1,6 @@
 # Build stage
-FROM golang:1.25-bookworm AS builder
+# golang:1.25.14-bookworm
+FROM golang@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS builder
 
 WORKDIR /app
 
@@ -14,7 +15,8 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o lightcms ./cmd/server
 
 # Runtime stage (Debian for Cloudflare WARP support)
-FROM debian:bookworm-slim
+# debian:bookworm-20261104-slim
+FROM debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg dbus bash \
