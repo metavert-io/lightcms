@@ -913,13 +913,10 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 			file, header, err := r.FormFile("field_" + field.Name)
 			if err == nil {
 				defer file.Close()
-				filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), header.Filename)
-				filepath := filepath.Join("static/uploads", filename)
-				dst, err := os.Create(filepath)
-				if err == nil {
-					defer dst.Close()
-					io.Copy(dst, file)
-					data[field.Name] = "/uploads/" + filename
+				if uploaded, err := saveUpload(file, "", header.Filename); err == nil {
+					data[field.Name] = uploaded
+				} else {
+					log.Printf("Failed to save upload for field %s: %v", field.Name, err)
 				}
 			}
 		} else {
@@ -1033,13 +1030,10 @@ func (h *Handler) CreateContent(w http.ResponseWriter, r *http.Request) {
 	ogFile, ogHeader, err := r.FormFile("og_image")
 	if err == nil {
 		defer ogFile.Close()
-		filename := fmt.Sprintf("%d_og_%s", time.Now().UnixNano(), ogHeader.Filename)
-		ogFilepath := filepath.Join("static/uploads", filename)
-		dst, err := os.Create(ogFilepath)
-		if err == nil {
-			defer dst.Close()
-			io.Copy(dst, ogFile)
-			ogImage = "/uploads/" + filename
+		if uploaded, err := saveUpload(ogFile, "og_", ogHeader.Filename); err == nil {
+			ogImage = uploaded
+		} else {
+			log.Printf("Failed to save OG image upload: %v", err)
 		}
 	}
 
@@ -1312,13 +1306,10 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 			file, header, err := r.FormFile("field_" + field.Name)
 			if err == nil {
 				defer file.Close()
-				filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), header.Filename)
-				filepath := filepath.Join("static/uploads", filename)
-				dst, err := os.Create(filepath)
-				if err == nil {
-					defer dst.Close()
-					io.Copy(dst, file)
-					data[field.Name] = "/uploads/" + filename
+				if uploaded, err := saveUpload(file, "", header.Filename); err == nil {
+					data[field.Name] = uploaded
+				} else {
+					log.Printf("Failed to save upload for field %s: %v", field.Name, err)
 				}
 			} else if existingData, ok := existingContent.Data[field.Name]; ok {
 				data[field.Name] = existingData
@@ -1503,13 +1494,10 @@ func (h *Handler) UpdateContent(w http.ResponseWriter, r *http.Request) {
 	ogFile, ogHeader, err := r.FormFile("og_image")
 	if err == nil {
 		defer ogFile.Close()
-		filename := fmt.Sprintf("%d_og_%s", time.Now().UnixNano(), ogHeader.Filename)
-		ogFilepath := filepath.Join("static/uploads", filename)
-		dst, err := os.Create(ogFilepath)
-		if err == nil {
-			defer dst.Close()
-			io.Copy(dst, ogFile)
-			ogImage = "/uploads/" + filename
+		if uploaded, err := saveUpload(ogFile, "og_", ogHeader.Filename); err == nil {
+			ogImage = uploaded
+		} else {
+			log.Printf("Failed to save OG image upload: %v", err)
 		}
 	}
 

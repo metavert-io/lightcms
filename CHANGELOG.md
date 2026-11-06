@@ -4,6 +4,16 @@ All notable changes to LightCMS are documented here, organized by version.
 
 ---
 
+## [7.4.6] - 2026-11-06
+
+### Fixed
+- **Images uploaded in the admin editor survive a deploy.** An image field or OG image uploaded through the page form was written to `static/uploads` inside the running image, which every deploy replaces, so the picture disappeared at the next deploy and the page showed a broken image, unless the machine that ran the deploy happened to have a copy of the file. These uploads are now written to `content/uploads`, on the persistent volume, and `/uploads/` is served from there; their URLs are unchanged. At startup the server copies any file the image still carries in `static/uploads` into `content/uploads` (never overwriting one), so files baked into earlier images keep working. Asset-library, API and MCP uploads were already on the volume.
+
+### Internal
+- **Docker base images are pinned by digest** in `Dockerfile`, `Dockerfile.mcp` and `Dockerfile.smithery`, with the tag each was resolved from in a comment above it. `Dockerfile.smithery` builds again: its Go 1.24 image refused this module's `go 1.25.0` requirement. It now uses the same Go 1.25.14 as the other two, and Alpine 3.23 instead of `alpine:latest`.
+
+---
+
 ## [7.4.5] - 2026-10-16
 
 ### Changed
