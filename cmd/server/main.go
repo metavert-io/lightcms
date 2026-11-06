@@ -133,6 +133,14 @@ func main() {
 		log.Printf("Warning: Failed to regenerate theme CSS on startup: %v", err)
 	}
 
+	// Admin editor uploads live in content/uploads, on the persistent volume. Copy any that
+	// this image still carries in static/uploads, where they were written before 7.4.6.
+	if n, err := handlers.MigrateLegacyUploads(); err != nil {
+		log.Printf("Warning: Failed to copy legacy uploads: %v", err)
+	} else if n > 0 {
+		log.Printf("Copied %d legacy upload(s) into %s", n, handlers.UploadsDir)
+	}
+
 	// Initialize services for API and change watcher
 	contentService := services.NewContentService(db)
 	h.SetContentService(contentService)
@@ -228,7 +236,7 @@ func main() {
 
 	// Static files
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-	r.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir("static/uploads"))))
+	r.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir(handlers.UploadsDir))))
 
 	// CSRF protection for admin routes
 	// Derive a 32-byte CSRF key by hashing the session secret with SHA-256.

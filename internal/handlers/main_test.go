@@ -24,6 +24,8 @@ func TestMain(m *testing.M) {
 	}
 	sitemapFile = filepath.Join(tmp, "sitemap.xml")
 	services.ThemeCSSFile = filepath.Join(tmp, "css", "theme-vars.css")
+	UploadsDir = filepath.Join(tmp, "uploads")
+	legacyUploadsDir = filepath.Join(tmp, "legacy-uploads")
 	changed := testutil.SnapshotTrackedFiles()
 
 	code := m.Run()
