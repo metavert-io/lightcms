@@ -14,13 +14,22 @@ import (
 	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
+	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/services"
 	"github.com/metavert-io/lightcms/v7/internal/testutil"
 
 	"github.com/gorilla/sessions"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func newTestHandler(t *testing.T) (*Handler, *services.OAuthService, func()) {
+	t.Helper()
+	handler, oauthService, _, cleanup := newTestHandlerWithUsers(t)
+	return handler, oauthService, cleanup
+}
+
+func newTestHandlerWithUsers(t *testing.T) (*Handler, *services.OAuthService, *services.UserService, func()) {
 	t.Helper()
 	db, cleanup := testutil.MustConnectTestDB(t)
 
@@ -31,7 +40,35 @@ func newTestHandler(t *testing.T) (*Handler, *services.OAuthService, func()) {
 	authManager.MigrateToMultiUser(context.Background())
 
 	handler := NewHandler(oauthService, authManager, "https://example.com", "test-session-secret")
-	return handler, oauthService, cleanup
+	return handler, oauthService, userService, cleanup
+}
+
+const testPassword = "correct horse battery staple"
+
+// testAccount creates an account that has already chosen its own password.
+func testAccount(t *testing.T, users *services.UserService, email, role string) *models.User {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte(testPassword), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hashing password: %v", err)
+	}
+	user, err := users.CreateUserWithHash(context.Background(), email, email, role, string(hash), false)
+	if err != nil {
+		t.Fatalf("CreateUserWithHash: %v", err)
+	}
+	return user
+}
+
+const testResourceURL = "https://example.com/mcp"
+
+// testGrant records that a new person approved the client.
+func testGrant(t *testing.T, oauthSvc *services.OAuthService, client *models.OAuthClient) *models.OAuthGrant {
+	t.Helper()
+	grant, err := oauthSvc.SaveGrant(context.Background(), client, primitive.NewObjectID(), testResourceURL)
+	if err != nil {
+		t.Fatalf("SaveGrant: %v", err)
+	}
+	return grant
 }
 
 func TestRegister_Success(t *testing.T) {
@@ -360,47 +397,41 @@ func TestJWKSHandler(t *testing.T) {
 	}
 }
 
-func TestTokenRevocation(t *testing.T) {
-	handler, _, cleanup := newTestHandler(t)
-	defer cleanup()
-
-	req := httptest.NewRequest(http.MethodPost, "/oauth/revoke", nil)
-	rr := httptest.NewRecorder()
-	handler.TokenRevocation(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", rr.Code)
-	}
-}
-
 func TestComputeVerifyLoginProof(t *testing.T) {
 	handler, _, cleanup := newTestHandler(t)
 	defer cleanup()
 
+	userID := "user-1"
 	clientID := "test-client"
 	redirectURI := "http://localhost/cb"
 	codeChallenge := "challenge123"
+	resource := testResourceURL
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 
-	proof := handler.computeLoginProof(clientID, redirectURI, codeChallenge, ts)
+	proof := handler.computeLoginProof(userID, clientID, redirectURI, codeChallenge, resource, ts)
 	if proof == "" {
 		t.Error("expected non-empty proof")
 	}
 
 	// Verify should pass
-	if !handler.verifyLoginProof(clientID, redirectURI, codeChallenge, ts, proof) {
+	if !handler.verifyLoginProof(userID, clientID, redirectURI, codeChallenge, resource, ts, proof) {
 		t.Error("expected proof to be valid")
 	}
 
 	// Wrong proof should fail
-	if handler.verifyLoginProof(clientID, redirectURI, codeChallenge, ts, "wrong-proof") {
+	if handler.verifyLoginProof(userID, clientID, redirectURI, codeChallenge, resource, ts, "wrong-proof") {
 		t.Error("expected wrong proof to fail")
 	}
 
-	// Different params should produce different proof
-	proof2 := handler.computeLoginProof("other-client", redirectURI, codeChallenge, ts)
-	if proof == proof2 {
-		t.Error("different params should produce different proof")
+	// A proof is good only for the person, client and resource it was made for
+	if handler.verifyLoginProof("user-2", clientID, redirectURI, codeChallenge, resource, ts, proof) {
+		t.Error("expected proof to be bound to the user")
+	}
+	if handler.verifyLoginProof(userID, "other-client", redirectURI, codeChallenge, resource, ts, proof) {
+		t.Error("expected proof to be bound to the client")
+	}
+	if handler.verifyLoginProof(userID, clientID, redirectURI, codeChallenge, "https://other.example/mcp", ts, proof) {
+		t.Error("expected proof to be bound to the resource")
 	}
 }
 
@@ -410,9 +441,9 @@ func TestVerifyLoginProof_Expired(t *testing.T) {
 
 	// Use a timestamp from 10 minutes ago (proof max age is 5 minutes)
 	oldTs := strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10)
-	proof := handler.computeLoginProof("client", "uri", "challenge", oldTs)
+	proof := handler.computeLoginProof("user", "client", "uri", "challenge", testResourceURL, oldTs)
 
-	if handler.verifyLoginProof("client", "uri", "challenge", oldTs, proof) {
+	if handler.verifyLoginProof("user", "client", "uri", "challenge", testResourceURL, oldTs, proof) {
 		t.Error("expected expired proof to fail")
 	}
 }
@@ -421,7 +452,7 @@ func TestVerifyLoginProof_InvalidTimestamp(t *testing.T) {
 	handler, _, cleanup := newTestHandler(t)
 	defer cleanup()
 
-	if handler.verifyLoginProof("client", "uri", "challenge", "not-a-number", "proof") {
+	if handler.verifyLoginProof("user", "client", "uri", "challenge", testResourceURL, "not-a-number", "proof") {
 		t.Error("expected invalid timestamp to fail")
 	}
 }
@@ -448,8 +479,9 @@ func TestJsonError(t *testing.T) {
 // AuthorizeSubmit tests
 
 func TestAuthorizeSubmit_LoginSuccess(t *testing.T) {
-	handler, oauthSvc, cleanup := newTestHandler(t)
+	handler, oauthSvc, users, cleanup := newTestHandlerWithUsers(t)
 	defer cleanup()
+	testAccount(t, users, "author@example.com", models.RoleEditor)
 
 	client, _, err := oauthSvc.RegisterClient(context.Background(), "Test App", []string{"http://localhost/cb"})
 	if err != nil {
@@ -464,8 +496,8 @@ func TestAuthorizeSubmit_LoginSuccess(t *testing.T) {
 		"code_challenge":        {"challenge123"},
 		"code_challenge_method": {"S256"},
 		"action":                {"login"},
-		"email":                 {"admin@localhost"},
-		"password":              {"admin123"},
+		"email":                 {"author@example.com"},
+		"password":              {testPassword},
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
@@ -522,8 +554,9 @@ func TestAuthorizeSubmit_LoginWrongPassword(t *testing.T) {
 }
 
 func TestAuthorizeSubmit_Approve(t *testing.T) {
-	handler, oauthSvc, cleanup := newTestHandler(t)
+	handler, oauthSvc, users, cleanup := newTestHandlerWithUsers(t)
 	defer cleanup()
+	user := testAccount(t, users, "author@example.com", models.RoleEditor)
 
 	client, _, err := oauthSvc.RegisterClient(context.Background(), "Test App", []string{"http://localhost/cb"})
 	if err != nil {
@@ -532,7 +565,7 @@ func TestAuthorizeSubmit_Approve(t *testing.T) {
 
 	// Generate a valid login proof
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	proof := handler.computeLoginProof(client.ClientID, "http://localhost/cb", "challenge", ts)
+	proof := handler.computeLoginProof(user.ID.Hex(), client.ClientID, "http://localhost/cb", "challenge", testResourceURL, ts)
 
 	form := url.Values{
 		"client_id":             {client.ClientID},
@@ -542,6 +575,7 @@ func TestAuthorizeSubmit_Approve(t *testing.T) {
 		"code_challenge":        {"challenge"},
 		"code_challenge_method": {"S256"},
 		"action":                {"approve"},
+		"login_user":            {user.ID.Hex()},
 		"login_proof":           {proof},
 		"login_ts":              {ts},
 	}
@@ -582,7 +616,7 @@ func TestAuthorizeSubmit_ApproveExpiredProof(t *testing.T) {
 
 	// Expired timestamp
 	ts := strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10)
-	proof := handler.computeLoginProof(client.ClientID, "http://localhost/cb", "challenge", ts)
+	proof := handler.computeLoginProof("user", client.ClientID, "http://localhost/cb", "challenge", testResourceURL, ts)
 
 	form := url.Values{
 		"client_id":             {client.ClientID},
@@ -591,6 +625,7 @@ func TestAuthorizeSubmit_ApproveExpiredProof(t *testing.T) {
 		"code_challenge":        {"challenge"},
 		"code_challenge_method": {"S256"},
 		"action":                {"approve"},
+		"login_user":            {"user"},
 		"login_proof":           {proof},
 		"login_ts":              {ts},
 	}
@@ -712,7 +747,7 @@ func TestToken_AuthorizationCodeGrant(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	// Create auth code
-	code, _ := oauthSvc.CreateAuthCode(context.Background(), client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := oauthSvc.CreateAuthCode(context.Background(), testGrant(t, oauthSvc, client), "http://localhost/cb", challenge, "S256")
 
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -761,7 +796,7 @@ func TestToken_RefreshTokenGrant(t *testing.T) {
 	h := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
-	code, _ := oauthSvc.CreateAuthCode(context.Background(), client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := oauthSvc.CreateAuthCode(context.Background(), testGrant(t, oauthSvc, client), "http://localhost/cb", challenge, "S256")
 	_, refreshToken, _, _ := oauthSvc.ExchangeAuthCode(context.Background(), code, client.ClientID, "http://localhost/cb", verifier)
 
 	form := url.Values{
@@ -899,12 +934,13 @@ func TestRedirectWithError_InvalidURI(t *testing.T) {
 }
 
 func TestAuthorizeSubmit_ApproveNoState(t *testing.T) {
-	handler, oauthSvc, cleanup := newTestHandler(t)
+	handler, oauthSvc, users, cleanup := newTestHandlerWithUsers(t)
 	defer cleanup()
+	user := testAccount(t, users, "author@example.com", models.RoleEditor)
 
 	client, _, _ := oauthSvc.RegisterClient(context.Background(), "Test", []string{"http://localhost/cb"})
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	proof := handler.computeLoginProof(client.ClientID, "http://localhost/cb", "challenge", ts)
+	proof := handler.computeLoginProof(user.ID.Hex(), client.ClientID, "http://localhost/cb", "challenge", testResourceURL, ts)
 
 	form := url.Values{
 		"client_id":             {client.ClientID},
@@ -914,6 +950,7 @@ func TestAuthorizeSubmit_ApproveNoState(t *testing.T) {
 		"code_challenge":        {"challenge"},
 		"code_challenge_method": {"S256"},
 		"action":                {"approve"},
+		"login_user":            {user.ID.Hex()},
 		"login_proof":           {proof},
 		"login_ts":              {ts},
 	}

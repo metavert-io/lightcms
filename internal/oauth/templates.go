@@ -177,8 +177,9 @@ var oauthTemplates = map[string]string{
         {{else}}
             <p class="subtitle">Authorize application access</p>
             <div class="consent-info">
-                <p><span class="client-name">{{.ClientName}}</span> wants to access your LightCMS instance.</p>
-                <p class="access-note">This will grant full access to manage content, templates, assets, and settings via MCP.</p>
+                <p><span class="client-name">{{.ClientName}}</span> wants to connect to this site as <strong>{{.UserEmail}}</strong>.</p>
+                <p class="access-note">After you approve, your browser goes to <strong>{{.RedirectHost}}</strong>. The app chose its own name, so continue only if you started this connection and you recognise that address.</p>
+                <p class="access-note">It will act with your {{.UserRole}} role: {{.RoleSummary}}.</p>
             </div>
             <form method="POST" action="/oauth/authorize">
                 <input type="hidden" name="client_id" value="{{.ClientID}}">
@@ -189,6 +190,7 @@ var oauthTemplates = map[string]string{
                 <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
                 <input type="hidden" name="resource" value="{{.Resource}}">
                 <input type="hidden" name="scope" value="{{.Scope}}">
+                <input type="hidden" name="login_user" value="{{.LoginUser}}">
                 <input type="hidden" name="login_proof" value="{{.LoginProof}}">
                 <input type="hidden" name="login_ts" value="{{.LoginTS}}">
                 <input type="hidden" name="action" value="approve">

@@ -319,6 +319,9 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.PublishNew && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return
+	}
 	user := a.getAPIUser(r)
 	var userID primitive.ObjectID
 	var userEmail string

@@ -26,7 +26,7 @@ type UploadAssetInput struct {
 	Filename    string `json:"filename" jsonschema:"Original filename with extension,required"`
 	ServePath   string `json:"serve_path" jsonschema:"URL path where file will be served (e.g., /images/logo.png),required"`
 	Description string `json:"description,omitempty" jsonschema:"Optional description of the asset"`
-	FilePath    string `json:"file_path,omitempty" jsonschema:"Absolute local filesystem path to read the file from. Preferred over data_base64 for large files — avoids MCP transport size limits."`
+	FilePath    string `json:"file_path,omitempty" jsonschema:"Absolute local filesystem path to read the file from (only when this MCP server runs on your own machine). Preferred over data_base64 for large files — avoids MCP transport size limits."`
 	DataBase64  string `json:"data_base64,omitempty" jsonschema:"Base64-encoded file content. Use for small files (<100KB). For larger files, prefer file_path."`
 }
 
@@ -111,8 +111,8 @@ func (s *Server) registerAssetTools() {
 		Description: `Upload or replace an asset in the asset library. Re-uploading to the same serve_path replaces the existing file in place — no need to delete first.
 
 Provide file content via one of:
-- file_path: Absolute local path to the file (preferred for files >100KB — avoids MCP transport size limits)
-- data_base64: Base64-encoded file content (fine for small files)
+- file_path: Absolute local path to the file (preferred for files >100KB — avoids MCP transport size limits). Only available when this MCP server runs on your own machine (the stdio binary), not over a hosted /mcp connection.
+- data_base64: Base64-encoded file content (fine for small files; required over a hosted /mcp connection)
 
 Validates file type and MIME type for security.`,
 		Annotations: &mcp.ToolAnnotations{
@@ -134,6 +134,9 @@ Validates file type and MIME type for security.`,
 		}
 
 		if args.FilePath != "" {
+			if !s.localFiles {
+				return errorResult(fmt.Errorf("file_path is only available when the MCP server runs on your own machine; send the file as data_base64")), nil, nil
+			}
 			// Read file locally and base64-encode it — avoids MCP transport size limits
 			fileData, err := os.ReadFile(args.FilePath)
 			if err != nil {

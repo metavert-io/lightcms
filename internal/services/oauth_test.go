@@ -6,12 +6,25 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"testing"
-	"time"
 
+	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/testutil"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+const testResource = "https://example.com/mcp"
+
+// testGrant records that a new person approved the client.
+func testGrant(t *testing.T, svc *OAuthService, client *models.OAuthClient) *models.OAuthGrant {
+	t.Helper()
+	grant, err := svc.SaveGrant(context.Background(), client, primitive.NewObjectID(), testResource)
+	if err != nil {
+		t.Fatalf("SaveGrant: %v", err)
+	}
+	return grant
+}
 
 func TestHashToken(t *testing.T) {
 	token := "test-token-123"
@@ -216,7 +229,8 @@ func TestCreateAuthCode(t *testing.T) {
 	svc := NewOAuthService(db)
 	ctx := context.Background()
 
-	code, err := svc.CreateAuthCode(ctx, "client123", "http://localhost/cb", "challenge", "S256", "https://example.com/mcp")
+	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
+	code, err := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", "challenge", "S256")
 	if err != nil {
 		t.Fatalf("CreateAuthCode failed: %v", err)
 	}
@@ -252,7 +266,7 @@ func TestExchangeAuthCode_FullFlow(t *testing.T) {
 		t.Fatalf("RegisterClient failed: %v", err)
 	}
 
-	code, err := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, err := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 	if err != nil {
 		t.Fatalf("CreateAuthCode failed: %v", err)
 	}
@@ -285,7 +299,7 @@ func TestExchangeAuthCode_SingleUse(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 
 	// First exchange should succeed
 	_, _, _, err := svc.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", verifier)
@@ -312,7 +326,7 @@ func TestExchangeAuthCode_WrongPKCE(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 
 	_, _, _, err := svc.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", "wrong-verifier")
 	if err == nil {
@@ -332,7 +346,7 @@ func TestExchangeAuthCode_ClientMismatch(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 
 	_, _, _, err := svc.ExchangeAuthCode(ctx, code, "wrong-client-id", "http://localhost/cb", verifier)
 	if err == nil {
@@ -352,7 +366,7 @@ func TestExchangeAuthCode_RedirectMismatch(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 
 	_, _, _, err := svc.ExchangeAuthCode(ctx, code, client.ClientID, "http://evil.com/steal", verifier)
 	if err == nil {
@@ -385,7 +399,7 @@ func TestRefreshAccessToken(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 
 	_, refreshToken, _, _ := svc.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", verifier)
 
@@ -429,7 +443,7 @@ func TestRefreshAccessToken_ClientMismatch(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(h[:])
 
 	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "")
+	code, _ := svc.CreateAuthCode(ctx, testGrant(t, svc, client), "http://localhost/cb", challenge, "S256")
 	_, refreshToken, _, _ := svc.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", verifier)
 
 	_, _, _, err := svc.RefreshAccessToken(ctx, refreshToken, "wrong-client")
@@ -446,67 +460,6 @@ func TestRefreshAccessToken_InvalidToken(t *testing.T) {
 	_, _, _, err := svc.RefreshAccessToken(context.Background(), "nonexistent", "client")
 	if err == nil {
 		t.Error("expected error for invalid refresh token")
-	}
-}
-
-func TestValidateAccessToken(t *testing.T) {
-	db, cleanup := testutil.MustConnectTestDB(t)
-	defer cleanup()
-
-	svc := NewOAuthService(db)
-	ctx := context.Background()
-
-	verifier := "verifier-for-validate-test"
-	h := sha256.Sum256([]byte(verifier))
-	challenge := base64.RawURLEncoding.EncodeToString(h[:])
-
-	client, _, _ := svc.RegisterClient(ctx, "Test", []string{"http://localhost/cb"})
-	code, _ := svc.CreateAuthCode(ctx, client.ClientID, "http://localhost/cb", challenge, "S256", "https://example.com/mcp")
-	accessToken, _, _, _ := svc.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", verifier)
-
-	// Valid token
-	token, err := svc.ValidateAccessToken(ctx, accessToken)
-	if err != nil {
-		t.Fatalf("ValidateAccessToken failed: %v", err)
-	}
-	if token.ClientID != client.ClientID {
-		t.Errorf("expected client ID %q, got %q", client.ClientID, token.ClientID)
-	}
-	if token.Resource != "https://example.com/mcp" {
-		t.Errorf("expected resource, got %q", token.Resource)
-	}
-
-	// Invalid token
-	_, err = svc.ValidateAccessToken(ctx, "nonexistent")
-	if err == nil {
-		t.Error("expected error for invalid access token")
-	}
-}
-
-func TestValidateAccessToken_Expired(t *testing.T) {
-	db, cleanup := testutil.MustConnectTestDB(t)
-	defer cleanup()
-
-	svc := NewOAuthService(db)
-	ctx := context.Background()
-
-	// Manually insert an expired token
-	rawToken := "expired-test-token"
-	tokenHash := hashToken(rawToken)
-	_, err := db.InsertOne(ctx, "oauth_access_tokens", bson.M{
-		"token_hash": tokenHash,
-		"client_id":  "test-client",
-		"resource":   "",
-		"expires_at": time.Now().Add(-1 * time.Hour),
-		"created_at": time.Now().Add(-2 * time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("failed to insert expired token: %v", err)
-	}
-
-	_, err = svc.ValidateAccessToken(ctx, rawToken)
-	if err == nil {
-		t.Error("expected error for expired access token")
 	}
 }
 

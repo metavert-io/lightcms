@@ -2,58 +2,40 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"log"
 
 	"github.com/metavert-io/lightcms/v7/internal/database"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// EnsureSystemAPIKey creates or retrieves the system-internal API key used for
-// OAuth-authenticated MCP sessions. The key is associated with the given admin
-// user so that OAuth-authenticated requests are authorized with admin-level
-// permissions (rather than bypassing permission checks via a nil user).
-// The raw key is stored in the settings collection so it persists across restarts.
-func EnsureSystemAPIKey(ctx context.Context, db *database.DB, apiKeyService *APIKeyService, adminUserID *primitive.ObjectID) (string, error) {
-	// Check if system key already exists
+// RemoveLegacySystemKey deletes what is left of the shared admin key that
+// OAuth sessions used to run on before 7.5.0: the "System (OAuth)" API key and
+// the stored copy of its raw value. The key goes first, so a failure part way
+// leaves the stored value for the next startup to find. It reports whether it
+// removed anything.
+func RemoveLegacySystemKey(ctx context.Context, db *database.DB) (bool, error) {
 	var setting struct {
 		RawKey string `bson:"raw_key"`
 	}
-	err := db.FindOne(ctx, "settings", bson.M{"type": "system_api_key"}, &setting)
-	if err == nil && setting.RawKey != "" {
-		// Verify the key is still valid in the api_keys collection
-		if existingKey, err := apiKeyService.ValidateAPIKey(ctx, setting.RawKey); err == nil {
-			// If the key exists but has no user, update it to use the admin user.
-			if existingKey.UserID == nil && adminUserID != nil {
-				db.UpdateOne(ctx, "api_keys", bson.M{"_id": existingKey.ID}, //nolint:errcheck
-					bson.M{"$set": bson.M{"user_id": adminUserID}})
-				log.Printf("Updated system API key to associate with admin user")
-			}
-			return setting.RawKey, nil
-		}
-		// Key was deleted or invalid, fall through to create a new one
-		log.Printf("System API key invalid, creating new one")
-	}
+	haveSetting := db.FindOne(ctx, "settings", bson.M{"type": "system_api_key"}, &setting) == nil
 
-	// Create new system API key associated with the admin user
-	rawKey, _, err := apiKeyService.CreateAPIKeyForUser(ctx, "System (OAuth)", "Internal key for OAuth-authenticated MCP sessions", adminUserID)
+	filters := bson.A{bson.M{"name": "System (OAuth)", "description": "Internal key for OAuth-authenticated MCP sessions"}}
+	if setting.RawKey != "" {
+		sum := sha256.Sum256([]byte(setting.RawKey))
+		filters = append(filters, bson.M{"key_hash": hex.EncodeToString(sum[:])})
+	}
+	removed, err := db.DeleteMany(ctx, "api_keys", bson.M{"$or": filters})
 	if err != nil {
-		return "", fmt.Errorf("failed to create system API key: %w", err)
+		return false, fmt.Errorf("deleting the system API key: %w", err)
 	}
-
-	// Store raw key in settings for persistence
-	_, upsertErr := db.Settings().UpdateOne(ctx,
-		bson.M{"type": "system_api_key"},
-		bson.M{"$set": bson.M{"type": "system_api_key", "raw_key": rawKey}},
-		options.Update().SetUpsert(true),
-	)
-	if upsertErr != nil {
-		return "", fmt.Errorf("failed to store system API key: %w", upsertErr)
+	if !haveSetting {
+		return removed > 0, nil
 	}
-
-	log.Printf("Created system API key for OAuth MCP sessions (associated with admin user)")
-	return rawKey, nil
+	if err := db.DeleteOne(ctx, "settings", bson.M{"type": "system_api_key"}); err != nil {
+		return removed > 0, fmt.Errorf("deleting the stored system API key: %w", err)
+	}
+	return true, nil
 }

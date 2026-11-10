@@ -132,9 +132,14 @@ type SessionUser struct {
 	Email       string   `json:"email"`
 	Role        string   `json:"role"`
 	ViaAPIKey   bool     `json:"via_api_key,omitempty"`  // true when authenticated via API key (not session)
+	ViaOAuth    bool     `json:"via_oauth,omitempty"`    // true when authenticated via an OAuth connection (not session)
+	Credential  string   `json:"credential,omitempty"`   // the API key or OAuth connection in use: "apikey:<id>" or "oauth:<grant id>"
 	Scopes      []string `json:"scopes,omitempty"`       // API-key permission allowlist; empty = full role permissions
 	SandboxOnly bool     `json:"sandbox_only,omitempty"` // API key restricted to fork-sandboxed content writes
 }
+
+// CredentialKey implements middleware.CredentialBound.
+func (u *SessionUser) CredentialKey() string { return u.Credential }
 
 // sandboxAllowedPerms is the permission set available to sandbox-only API
 // keys: reading, creating/editing content (fork-scoped, enforced by the

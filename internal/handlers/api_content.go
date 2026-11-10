@@ -295,6 +295,27 @@ func (a *APIHandler) APIGetBacklinks(w http.ResponseWriter, r *http.Request) {
 	a.jsonResponse(w, http.StatusOK, backlinks)
 }
 
+// applyPublishedField applies a "published" value from a partial update. A
+// request that changes whether a live page is published needs content.publish,
+// like the publish and unpublish endpoints. A fork copy is never published, so
+// the value is ignored there. It reports false after writing a refusal.
+func (a *APIHandler) applyPublishedField(w http.ResponseWriter, r *http.Request, content *models.Content, raw map[string]json.RawMessage) bool {
+	v, ok := raw["published"]
+	if !ok || content.ForkID != nil {
+		return true
+	}
+	var published bool
+	if err := json.Unmarshal(v, &published); err != nil {
+		a.jsonError(w, http.StatusBadRequest, "published must be true or false")
+		return false
+	}
+	if published != content.Published && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return false
+	}
+	content.Published = published
+	return true
+}
+
 func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 	if !a.requirePermission(w, r, auth.PermContentCreate) {
 		return
@@ -330,6 +351,12 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 
 	if req.TemplateID == "" || req.Title == "" || req.Slug == "" {
 		a.jsonError(w, http.StatusBadRequest, "template_id, title, and slug are required")
+		return
+	}
+
+	// Creating a published page is publishing it. (A page created in a fork
+	// goes live only through a merge.)
+	if req.Published && req.ForkID == "" && !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
 
@@ -406,7 +433,7 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		AuthorName:      req.AuthorName,
 		AuthorURL:       req.AuthorURL,
 		Data:            req.Data,
-		Published:       req.Published,
+		Published:       req.Published && forkID == nil, // a fork copy is never published
 		UseHeader:       req.UseHeader,
 		UseFooter:       req.UseFooter,
 		UseTheme:        req.UseTheme,
@@ -553,8 +580,8 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if v, ok := raw["published"]; ok {
-		json.Unmarshal(v, &content.Published)
+	if !a.applyPublishedField(w, r, content, raw) {
+		return
 	}
 	if v, ok := raw["use_header"]; ok {
 		json.Unmarshal(v, &content.UseHeader)
@@ -615,6 +642,16 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 	id, err := primitive.ObjectIDFromHex(mux.Vars(r)["id"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid content ID")
+		return
+	}
+
+	// Restoring a page that was live before it was deleted publishes it again.
+	deleted, err := a.contentService.GetContent(r.Context(), id)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "content not found")
+		return
+	}
+	if deleted.PublishedBeforeDelete && deleted.ForkID == nil && !deleted.Hold && !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
 
@@ -736,6 +773,22 @@ func (a *APIHandler) APIRevertContentVersion(w http.ResponseWriter, r *http.Requ
 	comment := req.VersionComment
 	if comment == "" {
 		comment = fmt.Sprintf("Reverted to version %d", version)
+	}
+
+	// A revert restores the version's published state too: changing what
+	// is live needs content.publish, as publishing does.
+	current, err := a.contentService.GetContent(r.Context(), id)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "content not found")
+		return
+	}
+	target, err := a.contentService.GetVersion(r.Context(), id, version)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "version not found")
+		return
+	}
+	if target.Published != current.Published && current.ForkID == nil && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return
 	}
 
 	if err := a.contentService.RevertToVersion(r.Context(), id, version, comment); err != nil {
@@ -1481,8 +1534,8 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 	if v, ok := raw["author_url"]; ok {
 		json.Unmarshal(v, &content.AuthorURL)
 	}
-	if v, ok := raw["published"]; ok {
-		json.Unmarshal(v, &content.Published)
+	if !a.applyPublishedField(w, r, content, raw) {
+		return
 	}
 	if v, ok := raw["use_header"]; ok {
 		json.Unmarshal(v, &content.UseHeader)
@@ -1926,6 +1979,14 @@ func (a *APIHandler) APIBulkCreateContent(w http.ResponseWriter, r *http.Request
 	if len(req.Items) > 100 {
 		a.jsonError(w, http.StatusBadRequest, "maximum 100 items per batch")
 		return
+	}
+	for _, item := range req.Items {
+		if item.Published {
+			if !a.requirePermission(w, r, auth.PermContentPublish) {
+				return
+			}
+			break
+		}
 	}
 
 	// Resolve templates and folders once

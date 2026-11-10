@@ -221,7 +221,7 @@ func CleanupCollections(t *testing.T, db *database.DB) {
 		"custom_pages", "settings", "theme_versions", "contact_messages",
 		"login_attempts", "assets", "api_keys", "redirects", "snippets",
 		"users", "audit_logs", "user_activity",
-		"oauth_clients", "oauth_auth_codes", "oauth_access_tokens", "oauth_refresh_tokens",
+		"oauth_clients", "oauth_grants", "oauth_auth_codes", "oauth_access_tokens", "oauth_refresh_tokens",
 		"content_comments", "content_locks", "webhooks", "webhook_deliveries",
 		"content_forks", "approval_workflows", "approval_requests",
 		"import_sources", "import_jobs", "link_check_jobs", "regen_jobs",

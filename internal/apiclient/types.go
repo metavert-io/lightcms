@@ -192,7 +192,6 @@ type UploadAssetRequest struct {
 	Filename    string `json:"filename"`
 	ServePath   string `json:"serve_path"`
 	DataBase64  string `json:"data_base64,omitempty"`
-	FilePath    string `json:"file_path,omitempty"`
 	Description string `json:"description,omitempty"`
 }
 

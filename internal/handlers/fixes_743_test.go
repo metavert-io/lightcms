@@ -654,13 +654,13 @@ func TestRemovedAdminRoutes(t *testing.T) {
 			t.Errorf("POST %s: %d, want 404/405 (the route was removed)", target, rr.Code)
 		}
 	}
-	src, err := os.ReadFile("../../cmd/server/main.go")
+	src, err := os.ReadFile("api_routes.go")
 	if err != nil {
-		t.Fatalf("read main.go: %v", err)
+		t.Fatalf("read api_routes.go: %v", err)
 	}
 	for _, route := range []string{`"/content/{id}/lock"`, `"/content/{id}/lock/force"`} {
 		if !strings.Contains(string(src), route) {
-			t.Errorf("main.go no longer registers the lock API route %s", route)
+			t.Errorf("api_routes.go no longer registers the lock API route %s", route)
 		}
 	}
 }

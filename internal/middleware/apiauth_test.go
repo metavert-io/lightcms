@@ -109,8 +109,9 @@ func TestAPIAuth_InvalidAPIKey(t *testing.T) {
 	}
 }
 
-func TestAPIAuth_ValidOAuthToken(t *testing.T) {
-	systemKey := "lc_system_key_12345678901234567890"
+func TestAPIAuth_OAuthTokenAcceptedAtMCPWithCallerAndHeaderUntouched(t *testing.T) {
+	type person struct{ Email string }
+	caller := &person{Email: "viewer@example.com"}
 	m := NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
 		return nil, fmt.Errorf("not an API key")
 	})
@@ -118,13 +119,45 @@ func TestAPIAuth_ValidOAuthToken(t *testing.T) {
 		if rawToken != "oauth_access_token_123" {
 			return nil, fmt.Errorf("invalid token")
 		}
-		return nil, nil
-	}, systemKey, "https://example.com/.well-known/oauth-protected-resource")
+		return caller, nil
+	}, "https://example.com/.well-known/oauth-protected-resource")
 
 	var capturedAuth string
-	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var capturedUser interface{}
+	handler := m.MCPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedAuth = r.Header.Get("Authorization")
+		capturedUser, _ = APIUserFromContext(r.Context())
 		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer oauth_access_token_123")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if capturedUser != caller {
+		t.Errorf("expected the signed-in person in context, got %+v", capturedUser)
+	}
+	if capturedAuth != "Bearer oauth_access_token_123" {
+		t.Errorf("Authorization header was rewritten to %q", capturedAuth)
+	}
+}
+
+func TestAPIAuth_OAuthTokenRefusedAtREST(t *testing.T) {
+	m := NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
+		return nil, fmt.Errorf("not an API key")
+	})
+	validated := false
+	m.SetOAuth(func(ctx context.Context, rawToken string) (interface{}, error) {
+		validated = true
+		return "someone", nil
+	}, "https://example.com/.well-known/oauth-protected-resource")
+
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler must not run for an OAuth token at /api/v1")
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
@@ -132,36 +165,104 @@ func TestAPIAuth_ValidOAuthToken(t *testing.T) {
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
 	}
-
-	// Verify system API key was substituted
-	expected := "Bearer " + systemKey
-	if capturedAuth != expected {
-		t.Errorf("expected Authorization header %q, got %q", expected, capturedAuth)
+	if validated {
+		t.Error("the OAuth validator must not run at /api/v1")
 	}
 }
 
-func TestAPIAuth_InvalidOAuthToken(t *testing.T) {
+func TestAPIAuth_InvalidOAuthTokenAtMCP(t *testing.T) {
 	m := NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
 		return nil, fmt.Errorf("not an API key")
 	})
 	m.SetOAuth(func(ctx context.Context, rawToken string) (interface{}, error) {
 		return nil, fmt.Errorf("invalid token")
-	}, "lc_system", "https://example.com/.well-known/oauth-protected-resource")
+	}, "https://example.com/.well-known/oauth-protected-resource")
 
-	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	handler := m.MCPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler must not run for an invalid token")
 	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
 	req.Header.Set("Authorization", "Bearer bad_oauth_token")
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestAPIAuth_MCPRefusesBrowserSession(t *testing.T) {
+	m := NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
+		return nil, fmt.Errorf("invalid")
+	})
+	m.SetSessionAuth(func(r *http.Request) interface{} { return "cookie user" }, nil)
+
+	handler := m.MCPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler must not run for a browser session at /mcp")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestAPIAuth_InternalCallerIsOnlyReachableThroughContext(t *testing.T) {
+	type person struct{ Email string }
+	caller := &person{Email: "agent@example.com"}
+	m := NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
+		return nil, fmt.Errorf("invalid")
+	})
+
+	var seen interface{}
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen, _ = APIUserFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil).WithContext(WithInternalCaller(context.Background(), caller))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || seen != caller {
+		t.Fatalf("in-process call: code %d, caller %+v", rr.Code, seen)
+	}
+
+	// The same request without the context value has no caller at all.
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/test", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("request from the network: expected 401, got %d", rr.Code)
+	}
+}
+
+type credentialCaller struct{ key string }
+
+func (c credentialCaller) CredentialKey() string { return c.key }
+
+func TestRateLimitKey_CountsAgainstTheCredential(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer lc_raw")
+	if got := rateLimitKey(req); got != "lc_raw" {
+		t.Errorf("without a caller: got %q", got)
+	}
+
+	withCaller := req.WithContext(context.WithValue(req.Context(), apiUserContextKey, credentialCaller{key: "oauth:abc"}))
+	if got := rateLimitKey(withCaller); got != "oauth:abc" {
+		t.Errorf("with a caller: got %q", got)
+	}
+
+	// An in-process call has no Authorization header but is still counted.
+	internal := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
+	internal = internal.WithContext(context.WithValue(internal.Context(), apiUserContextKey, credentialCaller{key: "oauth:abc"}))
+	if got := rateLimitKey(internal); got != "oauth:abc" {
+		t.Errorf("in-process: got %q", got)
 	}
 }
 
@@ -192,7 +293,7 @@ func TestAPIAuth_WWWAuthenticateHeader(t *testing.T) {
 	})
 	m.SetOAuth(func(ctx context.Context, rawToken string) (interface{}, error) {
 		return nil, fmt.Errorf("invalid")
-	}, "lc_system", resourceURL)
+	}, resourceURL)
 
 	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

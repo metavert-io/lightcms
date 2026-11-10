@@ -77,6 +77,9 @@ func (a *APIHandler) APICreateImportSource(w http.ResponseWriter, r *http.Reques
 		a.jsonError(w, http.StatusBadRequest, "url is required")
 		return
 	}
+	if body.AutoPublish && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return
+	}
 
 	schedule := body.Schedule
 	if schedule == "" {
@@ -186,6 +189,9 @@ func (a *APIHandler) APIUpdateImportSource(w http.ResponseWriter, r *http.Reques
 		updates["folder_path"] = *body.FolderPath
 	}
 	if body.AutoPublish != nil {
+		if *body.AutoPublish && !a.requirePermission(w, r, auth.PermContentPublish) {
+			return
+		}
 		updates["auto_publish"] = *body.AutoPublish
 	}
 	if body.Schedule != nil {
@@ -263,6 +269,15 @@ func (a *APIHandler) APITriggerImportSource(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	src, err := a.importService.GetSource(r.Context(), id)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "import source not found")
+		return
+	}
+	if src.AutoPublish && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return
+	}
+
 	triggeredBy := "api"
 	if user := a.getAPIUser(r); user != nil {
 		triggeredBy = user.Email
@@ -308,6 +323,9 @@ func (a *APIHandler) APIImportMarkdown(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(body.Pages) == 0 {
 		a.jsonError(w, http.StatusBadRequest, "pages is required and must be non-empty")
+		return
+	}
+	if body.AutoPublish && !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
 
@@ -377,6 +395,9 @@ func (a *APIHandler) APIImportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.TitleColumn == "" {
 		a.jsonError(w, http.StatusBadRequest, "title_column is required")
+		return
+	}
+	if body.AutoPublish && !a.requirePermission(w, r, auth.PermContentPublish) {
 		return
 	}
 

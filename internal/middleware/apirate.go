@@ -65,17 +65,25 @@ var apiKeyRateLimiter = struct {
 	tokens: make(map[string][]time.Time),
 }
 
-// APIRateLimit is middleware that enforces a per-bearer-token sliding-window rate limit
-// on the /api/v1/ subrouter. It runs after authentication so the token is already
+// rateLimitKey returns what a request is counted against: the credential the
+// caller signed in with, or failing that the raw bearer token. A browser session
+// has neither and is not limited here.
+func rateLimitKey(r *http.Request) string {
+	if key := CredentialKeyFromContext(r.Context()); key != "" {
+		return key
+	}
+	if auth := r.Header.Get("Authorization"); len(auth) > 7 {
+		return auth[7:] // strip "Bearer "
+	}
+	return ""
+}
+
+// APIRateLimit is middleware that enforces a per-credential sliding-window rate limit
+// on the /api/v1/ subrouter. It runs after authentication so the credential is already
 // validated; unauthenticated requests are rejected by the auth middleware first.
 func APIRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract the raw bearer token to use as the rate-limit key.
-		// We use the token directly (already validated by auth middleware).
-		token := ""
-		if auth := r.Header.Get("Authorization"); len(auth) > 7 {
-			token = auth[7:] // strip "Bearer "
-		}
+		token := rateLimitKey(r)
 		if token == "" {
 			// No token — auth middleware would have blocked this, but be safe.
 			next.ServeHTTP(w, r)
@@ -156,10 +164,7 @@ func init() {
 // APIBurstRateLimit is middleware that enforces 20 requests/second per bearer token.
 func APIBurstRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := ""
-		if auth := r.Header.Get("Authorization"); len(auth) > 7 {
-			token = auth[7:]
-		}
+		token := rateLimitKey(r)
 		if token == "" {
 			next.ServeHTTP(w, r)
 			return
@@ -263,6 +268,7 @@ var (
 	exportLimiter               = newEndpointRateLimiter(5)  // 5 exports per minute
 	reindexLimiter              = newEndpointRateLimiter(1)  // 1 full reindex per minute
 	commentCreateLimiter        = newEndpointRateLimiter(20) // 20 comments per minute per token
+	oauthRegisterLimiter        = newEndpointRateLimiter(10) // 10 client registrations per minute per address
 )
 
 // EndpointRateLimit returns middleware that enforces a per-token limit for a specific
@@ -270,10 +276,7 @@ var (
 func EndpointRateLimit(limiter *endpointRateLimiter, description string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			token := ""
-			if auth := r.Header.Get("Authorization"); len(auth) > 7 {
-				token = auth[7:]
-			}
+			token := rateLimitKey(r)
 			if token != "" && limiter.check(token) {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Retry-After", "60")
@@ -316,6 +319,27 @@ func ExportLimiter() func(http.Handler) http.Handler {
 // ReindexLimiter returns middleware limiting embedding reindex to 1/min per token.
 func ReindexLimiter() func(http.Handler) http.Handler {
 	return EndpointRateLimit(reindexLimiter, "reindex-embeddings (1/min)")
+}
+
+// OAuthRegisterLimiter returns middleware limiting OAuth client registration to
+// 10/min per client address. Registration is open to anyone, so it has no
+// credential to count against.
+func OAuthRegisterLimiter(proxy *TrustedProxyConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if oauthRegisterLimiter.check(GetClientIP(r, proxy)) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "60")
+				w.WriteHeader(http.StatusTooManyRequests)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error":             "too_many_requests",
+					"error_description": "Too many client registrations. Try again in a minute.",
+				})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // CommentCreateLimiter returns middleware limiting comment creation to 20/min per token.

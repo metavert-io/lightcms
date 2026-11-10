@@ -3,13 +3,10 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/apiclient"
 	"github.com/metavert-io/lightcms/v7/internal/mcp"
@@ -37,14 +34,12 @@ func main() {
 	// Every MCP session gets a unique agent-session ID. The server groups
 	// this session's changes in the audit log so humans can review or roll
 	// them back as a unit.
-	sessionBytes := make([]byte, 8)
-	if _, err := rand.Read(sessionBytes); err == nil {
-		client.SetAgentSession("agent-" + time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(sessionBytes))
-	}
+	client.SetAgentSession(apiclient.NewAgentSessionID())
 
 	// Create and run MCP server
 	ctx := context.Background()
 	server := mcp.NewServer(client)
+	server.AllowLocalFiles()
 	if err := server.Run(ctx); err != nil {
 		log.Printf("MCP server error: %v", err)
 		os.Exit(1)

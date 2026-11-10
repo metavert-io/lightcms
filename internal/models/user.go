@@ -35,8 +35,11 @@ type AuditLog struct {
 	// AgentSession groups all changes made by one AI-agent session (from the
 	// X-Agent-Session request header) so they can be reviewed and rolled
 	// back as a unit.
-	AgentSession string    `bson:"agent_session,omitempty" json:"agent_session,omitempty"`
-	CreatedAt    time.Time `bson:"created_at" json:"created_at"`
+	AgentSession string `bson:"agent_session,omitempty" json:"agent_session,omitempty"`
+	// Credential names the API key ("apikey:<id>") or OAuth connection
+	// ("oauth:<grant id>") a change was made with.
+	Credential string    `bson:"credential,omitempty" json:"credential,omitempty"`
+	CreatedAt  time.Time `bson:"created_at" json:"created_at"`
 }
 
 // Role constants

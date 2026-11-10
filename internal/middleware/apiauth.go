@@ -13,7 +13,33 @@ type contextKey int
 const (
 	// apiUserContextKey stores the authenticated API user in context
 	apiUserContextKey contextKey = iota
+	// internalCallerContextKey marks a same-process call to the REST API.
+	internalCallerContextKey
 )
+
+// CredentialBound is implemented by a caller that signed in with an API key or
+// OAuth connection. CredentialKey identifies that credential, stably and
+// without revealing it, for rate limiting and MCP session binding.
+type CredentialBound interface {
+	CredentialKey() string
+}
+
+// CredentialKeyFromContext returns the credential behind the authenticated
+// caller in ctx, or "" for a browser session or no caller.
+func CredentialKeyFromContext(ctx context.Context) string {
+	if bound, ok := ctx.Value(apiUserContextKey).(CredentialBound); ok {
+		return bound.CredentialKey()
+	}
+	return ""
+}
+
+// WithInternalCaller returns a context for calling the REST API from inside
+// this process on behalf of caller, who has already been authenticated.
+// Context values cannot arrive over the network, so a remote client cannot
+// claim this; only the MCP endpoint sets it.
+func WithInternalCaller(ctx context.Context, caller interface{}) context.Context {
+	return context.WithValue(ctx, internalCallerContextKey, caller)
+}
 
 // APIKeyValidateFunc validates an API key and returns the authenticated user (as interface{}).
 // The returned value will be stored in the request context and can be retrieved with APIUserFromContext.
@@ -45,7 +71,6 @@ type APIAuth struct {
 	validateOAuth       OAuthValidateFunc
 	validateSession     SessionValidateFunc
 	sessionCSRF         func(http.Handler) http.Handler // CSRF check for unsafe session-authenticated requests
-	systemAPIKey        string                          // internal API key substituted for OAuth-authenticated requests
 	resourceMetadataURL string                          // for WWW-Authenticate header (OAuth discovery)
 }
 
@@ -78,18 +103,23 @@ func isSafeMethod(method string) bool {
 	return false
 }
 
-// SetOAuth enables OAuth token validation alongside API key validation.
-// systemAPIKey is injected into the Authorization header for OAuth-authenticated
-// requests so the downstream MCP handler can use it for internal REST API calls.
-func (m *APIAuth) SetOAuth(validateOAuth OAuthValidateFunc, systemAPIKey, resourceMetadataURL string) {
+// SetOAuth enables OAuth tokens on MCPMiddleware. The validator returns the
+// signed-in person the token acts for.
+func (m *APIAuth) SetOAuth(validateOAuth OAuthValidateFunc, resourceMetadataURL string) {
 	m.validateOAuth = validateOAuth
-	m.systemAPIKey = systemAPIKey
 	m.resourceMetadataURL = resourceMetadataURL
 }
 
-// Middleware returns a gorilla/mux compatible middleware function
+// Middleware authenticates a REST API request: an API key, a browser session,
+// or a call from the MCP endpoint in this process. OAuth tokens are issued for
+// the MCP endpoint alone and are refused here.
 func (m *APIAuth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if caller := r.Context().Value(internalCallerContextKey); caller != nil {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), apiUserContextKey, caller)))
+			return
+		}
+
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			// No Authorization header — try session cookie fallback for browser-based admin UI calls
@@ -113,50 +143,73 @@ func (m *APIAuth) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Expect "Bearer <token>"
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			m.setWWWAuthenticate(w)
-			apiJsonError(w, http.StatusUnauthorized, "Invalid Authorization header format (expected: Bearer <token>)")
+		token, ok := m.bearerToken(w, authHeader)
+		if !ok {
 			return
 		}
 
-		token := parts[1]
+		if !strings.HasPrefix(token, "lc_") {
+			m.setWWWAuthenticate(w)
+			apiJsonError(w, http.StatusUnauthorized, "Invalid API key (OAuth access tokens are accepted only at the MCP endpoint)")
+			return
+		}
+		m.authenticate(w, r, next, m.validate, token, "Invalid API key")
+	})
+}
 
-		// Route based on token prefix: lc_ = API key, anything else = OAuth token
-		if strings.HasPrefix(token, "lc_") {
-			user, err := m.validate(r.Context(), token)
-			if err != nil {
-				m.setWWWAuthenticate(w)
-				apiJsonError(w, http.StatusUnauthorized, "Invalid API key")
-				return
-			}
-			// Inject user into request context
-			if user != nil {
-				r = r.WithContext(context.WithValue(r.Context(), apiUserContextKey, user))
-			}
-			next.ServeHTTP(w, r)
-		} else if m.validateOAuth != nil {
-			user, err := m.validateOAuth(r.Context(), token)
-			if err != nil {
-				m.setWWWAuthenticate(w)
-				apiJsonError(w, http.StatusUnauthorized, "Invalid access token")
-				return
-			}
-			// Inject user into request context
-			if user != nil {
-				r = r.WithContext(context.WithValue(r.Context(), apiUserContextKey, user))
-			}
-			// Replace Authorization header with system API key so downstream
-			// handlers (MCP http_handler, REST API) work correctly
-			r.Header.Set("Authorization", "Bearer "+m.systemAPIKey)
-			next.ServeHTTP(w, r)
-		} else {
+// MCPMiddleware authenticates a request to the MCP endpoint: an API key or an
+// OAuth token. A browser session is not accepted, because a page must not be
+// able to drive an agent session with a visitor's cookie.
+func (m *APIAuth) MCPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			m.setWWWAuthenticate(w)
+			apiJsonError(w, http.StatusUnauthorized, "Missing Authorization header")
+			return
+		}
+		token, ok := m.bearerToken(w, authHeader)
+		if !ok {
+			return
+		}
+
+		switch {
+		case strings.HasPrefix(token, "lc_"):
+			m.authenticate(w, r, next, m.validate, token, "Invalid API key")
+		case m.validateOAuth != nil:
+			m.authenticate(w, r, next, APIKeyValidateFunc(m.validateOAuth), token, "Invalid access token")
+		default:
 			m.setWWWAuthenticate(w)
 			apiJsonError(w, http.StatusUnauthorized, "Invalid API key")
-			return
 		}
 	})
+}
+
+// bearerToken extracts the token from "Bearer <token>", writing the 401 itself
+// when the header has another form.
+func (m *APIAuth) bearerToken(w http.ResponseWriter, authHeader string) (string, bool) {
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		m.setWWWAuthenticate(w)
+		apiJsonError(w, http.StatusUnauthorized, "Invalid Authorization header format (expected: Bearer <token>)")
+		return "", false
+	}
+	return parts[1], true
+}
+
+// authenticate runs validate and, when it succeeds, calls next with the caller
+// in the request context.
+func (m *APIAuth) authenticate(w http.ResponseWriter, r *http.Request, next http.Handler, validate APIKeyValidateFunc, token, invalidMessage string) {
+	user, err := validate(r.Context(), token)
+	if err != nil {
+		m.setWWWAuthenticate(w)
+		apiJsonError(w, http.StatusUnauthorized, invalidMessage)
+		return
+	}
+	if user != nil {
+		r = r.WithContext(context.WithValue(r.Context(), apiUserContextKey, user))
+	}
+	next.ServeHTTP(w, r)
 }
 
 // setWWWAuthenticate adds the WWW-Authenticate header for OAuth discovery
