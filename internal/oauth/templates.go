@@ -78,6 +78,29 @@ var oauthTemplates = map[string]string{
             color: #94a3b8;
             font-size: 0.85rem;
         }
+        .access-choice {
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.5rem;
+        }
+        .access-choice legend {
+            color: #e2e8f0;
+            font-weight: 600;
+            padding: 0 0.25rem;
+        }
+        .access-choice .choice {
+            display: flex;
+            gap: 0.6rem;
+            align-items: flex-start;
+            color: #cbd5e1;
+            font-weight: 400;
+            font-size: 0.875rem;
+            line-height: 1.5;
+            margin: 0.5rem 0;
+            cursor: pointer;
+        }
+        .access-choice input { margin-top: 0.3rem; }
         label {
             display: block;
             color: #e2e8f0;
@@ -179,7 +202,7 @@ var oauthTemplates = map[string]string{
             <div class="consent-info">
                 <p><span class="client-name">{{.ClientName}}</span> wants to connect to this site as <strong>{{.UserEmail}}</strong>.</p>
                 <p class="access-note">After you approve, your browser goes to <strong>{{.RedirectHost}}</strong>. The app chose its own name, so continue only if you started this connection and you recognise that address.</p>
-                <p class="access-note">It will act with your {{.UserRole}} role: {{.RoleSummary}}.</p>
+                <p class="access-note">It acts with your {{.UserRole}} role ({{.RoleSummary}}), limited by the access you choose below. You can change or disconnect it at any time under Connected Apps.</p>
             </div>
             <form method="POST" action="/oauth/authorize">
                 <input type="hidden" name="client_id" value="{{.ClientID}}">
@@ -194,6 +217,14 @@ var oauthTemplates = map[string]string{
                 <input type="hidden" name="login_proof" value="{{.LoginProof}}">
                 <input type="hidden" name="login_ts" value="{{.LoginTS}}">
                 <input type="hidden" name="action" value="approve">
+                <fieldset class="access-choice">
+                    <legend>Access</legend>
+                    <label class="choice"><input type="radio" name="access" value="sandbox" checked> <span><strong>Sandbox</strong> (recommended). It can read the site, and it can change things only in forks of its own. Nothing goes live until a person merges them.</span></label>
+                    <label class="choice"><input type="radio" name="access" value="full"> <span><strong>Full</strong>. It can do anything your role can, directly on the live site.</span></label>
+                    {{if .CanGrantMerge}}
+                    <label class="choice"><input type="checkbox" name="can_merge_own_forks" value="1"> <span><strong>Let it merge its own forks.</strong> Its changes then go live without anyone reviewing them first.</span></label>
+                    {{end}}
+                </fieldset>
                 <button type="submit" class="btn btn-primary">Allow Access</button>
                 <button type="submit" name="action" value="deny" class="btn btn-deny">Deny</button>
             </form>

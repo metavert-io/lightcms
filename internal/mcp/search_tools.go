@@ -124,9 +124,6 @@ For targeted replacements, use scoped_search_replace_execute instead.`,
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args SearchReplaceExecuteInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("search_replace_execute"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if len(args.Pairs) > 0 {
 			pairs := make([]map[string]interface{}, len(args.Pairs))
 			for i, p := range args.Pairs {

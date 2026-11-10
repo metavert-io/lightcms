@@ -230,14 +230,3 @@ func TestDraftSafety_PurgeRefusedOnActiveFork(t *testing.T) {
 		t.Errorf("expected refusal for an active fork, got: %v %s", res.IsError, resultText(t, res))
 	}
 }
-
-func TestDraftSafety_PurgeBlockedInSandbox(t *testing.T) {
-	s, _, cleanup := newSandboxServer(t)
-	defer cleanup()
-
-	callTool(t, s, "start_agent_sandbox", map[string]interface{}{"name": "s"})
-	res := callTool(t, s, "purge_fork_copies", map[string]interface{}{"fork_id": "other"})
-	if !strings.Contains(resultText(t, res), "BLOCKED") {
-		t.Errorf("purge_fork_copies should be blocked while sandboxed, got: %s", resultText(t, res))
-	}
-}

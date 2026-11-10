@@ -91,18 +91,22 @@ func (c *Content) ModifiedAt() time.Time {
 
 // ContentFork represents a named workspace for staging site changes before merging to live
 type ContentFork struct {
-	ID             primitive.ObjectID  `bson:"_id,omitempty" json:"id"`
-	Name           string              `bson:"name" json:"name"`
-	Description    string              `bson:"description" json:"description"`
-	Status         string              `bson:"status" json:"status"`               // "active" | "merged" | "archived"
-	PreviewToken   string              `bson:"preview_token" json:"preview_token"` // random token for cookie-based preview
-	CreatedBy      primitive.ObjectID  `bson:"created_by" json:"created_by"`
-	CreatedByEmail string              `bson:"created_by_email" json:"created_by_email"`
-	CreatedAt      time.Time           `bson:"created_at" json:"created_at"`
-	MergedAt       *time.Time          `bson:"merged_at,omitempty" json:"merged_at,omitempty"`
-	MergedBy       *primitive.ObjectID `bson:"merged_by,omitempty" json:"merged_by,omitempty"`
-	MergedByEmail  string              `bson:"merged_by_email,omitempty" json:"merged_by_email,omitempty"`
-	ArchivedAt     *time.Time          `bson:"archived_at,omitempty" json:"archived_at,omitempty"`
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Name           string             `bson:"name" json:"name"`
+	Description    string             `bson:"description" json:"description"`
+	Status         string             `bson:"status" json:"status"`               // "active" | "merged" | "archived"
+	PreviewToken   string             `bson:"preview_token" json:"preview_token"` // random token for cookie-based preview
+	CreatedBy      primitive.ObjectID `bson:"created_by" json:"created_by"`
+	CreatedByEmail string             `bson:"created_by_email" json:"created_by_email"`
+	// CreatedByCredential is the API key or OAuth connection that created the
+	// fork ("apikey:<id>" / "oauth:<grant id>"); empty for a person in the
+	// admin UI and for forks made before 7.5.0.
+	CreatedByCredential string              `bson:"created_by_credential,omitempty" json:"created_by_credential,omitempty"`
+	CreatedAt           time.Time           `bson:"created_at" json:"created_at"`
+	MergedAt            *time.Time          `bson:"merged_at,omitempty" json:"merged_at,omitempty"`
+	MergedBy            *primitive.ObjectID `bson:"merged_by,omitempty" json:"merged_by,omitempty"`
+	MergedByEmail       string              `bson:"merged_by_email,omitempty" json:"merged_by_email,omitempty"`
+	ArchivedAt          *time.Time          `bson:"archived_at,omitempty" json:"archived_at,omitempty"`
 	// Page counts recorded at merge time (v7.4). The fork's page copies are
 	// deleted after a successful merge, so these are the history of what it did.
 	MergedCreated int `bson:"merged_created,omitempty" json:"merged_created,omitempty"`
@@ -178,9 +182,14 @@ type APIKey struct {
 	KeyHash     string              `bson:"key_hash" json:"-"`                                    // SHA-256 hash of full key
 	UserID      *primitive.ObjectID `bson:"user_id,omitempty" json:"user_id,omitempty"`           // Owning user
 	Scopes      []string            `bson:"scopes,omitempty" json:"scopes,omitempty"`             // Permission allowlist; empty = full owner permissions
-	SandboxOnly bool                `bson:"sandbox_only,omitempty" json:"sandbox_only,omitempty"` // Content writes must target a fork; live mutations rejected
-	LastUsedAt  *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
-	CreatedAt   time.Time           `bson:"created_at" json:"created_at"`
+	SandboxOnly bool                `bson:"sandbox_only,omitempty" json:"sandbox_only,omitempty"` // Content writes must target a fork the key created; live mutations rejected
+	// CanMergeOwnForks lets the key merge forks it created into the live
+	// site. Only a signed-in admin can turn it on.
+	CanMergeOwnForks bool `bson:"can_merge_own_forks,omitempty" json:"can_merge_own_forks,omitempty"`
+	// ActiveSandboxFork is the fork the key's current sandbox writes to.
+	ActiveSandboxFork *primitive.ObjectID `bson:"active_sandbox_fork,omitempty" json:"active_sandbox_fork,omitempty"`
+	LastUsedAt        *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
+	CreatedAt         time.Time           `bson:"created_at" json:"created_at"`
 }
 
 // Snippet is a named, reusable HTML fragment used as an item renderer in lc:query directives.

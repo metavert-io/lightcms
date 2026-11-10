@@ -391,7 +391,7 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		}
 
 		// Sandbox: create the page inside the sandbox fork instead of live.
-		if forkID, _, active := s.sandboxFork(); active {
+		if forkID, _, active := s.sandboxFork(ctx); active {
 			if args.Upsert {
 				return textResult("upsert is not available while an agent sandbox is active — use update_content so the change stays in the sandbox fork"), nil, nil
 			}
@@ -502,7 +502,7 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 
 		// Sandbox: redirect the write to the fork copy (copy-on-write).
 		targetID := args.ID
-		if _, _, active := s.sandboxFork(); active {
+		if _, _, active := s.sandboxFork(ctx); active {
 			tid, err := s.sandboxTargetForContent(ctx, args.ID)
 			if err != nil {
 				return errorResult(err), nil, nil
@@ -571,9 +571,6 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ContentIDInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("publish_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if err := s.client.PublishContent(ctx, args.ID); err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -593,9 +590,6 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ContentIDInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("unpublish_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if err := s.client.UnpublishContent(ctx, args.ID); err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -615,9 +609,6 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ContentIDInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("delete_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if err := s.client.DeleteContent(ctx, args.ID); err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -637,9 +628,6 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ContentIDInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("restore_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if err := s.client.RestoreContent(ctx, args.ID); err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -719,9 +707,6 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args RevertToVersionInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("revert_to_version"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if err := s.client.RevertContentVersion(ctx, args.ContentID, args.Version, args.VersionComment); err != nil {
 			return errorResult(err), nil, nil
 		}
@@ -749,9 +734,6 @@ Returns published IDs, skipped items, and any failures.`,
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args BatchPublishInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("publish_multiple"); blocked != nil {
-			return blocked, nil, nil
-		}
 		result, err := s.client.BatchPublishContent(ctx, args.IDs, args.PublishAllDrafts)
 		if err != nil {
 			return errorResult(err), nil, nil
@@ -810,7 +792,7 @@ Only the fields you provide are changed. Always include a version_comment descri
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args UpdateContentByPathInput) (*mcp.CallToolResult, any, error) {
 		// Sandbox: copy-on-write the page into the fork and update the copy.
 		sandboxID := ""
-		if _, _, active := s.sandboxFork(); active {
+		if _, _, active := s.sandboxFork(ctx); active {
 			tid, err := s.sandboxTargetForPath(ctx, args.Path)
 			if err != nil {
 				return errorResult(err), nil, nil
@@ -992,9 +974,6 @@ Example: {"search": "old text", "replace": "new text", "folder_path": "/blog", "
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ScopedSearchReplaceInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("scoped_search_replace_execute"); blocked != nil {
-			return blocked, nil, nil
-		}
 		scope := apiclient.ScopedSearchReplaceScope{
 			ContentIDs:   args.ContentIDs,
 			FolderPath:   args.FolderPath,
@@ -1028,9 +1007,6 @@ Returns: total attempted, succeeded, failed counts, and per-item {id, full_path,
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args BulkCreateContentInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("bulk_create_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		result, err := s.client.BulkCreateContent(ctx, args)
 		if err != nil {
 			return errorResult(err), nil, nil
@@ -1060,9 +1036,6 @@ Recommended batch size: up to 50 per call for optimal performance.`,
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args BulkUpdateContentInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("bulk_update_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		result, err := s.client.BulkUpdateContent(ctx, args)
 		if err != nil {
 			return errorResult(err), nil, nil
@@ -1096,9 +1069,6 @@ Example: {"operation": "prepend", "field": "disclaimer", "value": "<p>Note: </p>
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args BulkFieldOperationInput) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("bulk_field_operation"); blocked != nil {
-			return blocked, nil, nil
-		}
 		body := map[string]interface{}{
 			"operation":       args.Operation,
 			"field":           args.Field,

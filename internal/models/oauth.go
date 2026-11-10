@@ -27,10 +27,18 @@ type OAuthGrant struct {
 	ClientName string             `bson:"client_name" json:"client_name"` // as registered, for display; chosen by the client
 	UserID     primitive.ObjectID `bson:"user_id" json:"user_id"`
 	Resource   string             `bson:"resource" json:"resource"`
-	CreatedAt  time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt  time.Time          `bson:"updated_at" json:"updated_at"`
-	LastUsedAt *time.Time         `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
-	RevokedAt  *time.Time         `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
+	// SandboxOnly confines the connection to forks it created; nothing it
+	// does changes the live site unless CanMergeOwnForks lets it merge them.
+	SandboxOnly bool `bson:"sandbox_only" json:"sandbox_only"`
+	// CanMergeOwnForks lets the connection merge forks it created into the
+	// live site. Only a signed-in admin can turn it on.
+	CanMergeOwnForks bool `bson:"can_merge_own_forks" json:"can_merge_own_forks"`
+	// ActiveSandboxFork is the fork the connection's current sandbox writes to.
+	ActiveSandboxFork *primitive.ObjectID `bson:"active_sandbox_fork,omitempty" json:"active_sandbox_fork,omitempty"`
+	CreatedAt         time.Time           `bson:"created_at" json:"created_at"`
+	UpdatedAt         time.Time           `bson:"updated_at" json:"updated_at"`
+	LastUsedAt        *time.Time          `bson:"last_used_at,omitempty" json:"last_used_at,omitempty"`
+	RevokedAt         *time.Time          `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
 }
 
 // OAuthAuthCode represents a pending authorization code

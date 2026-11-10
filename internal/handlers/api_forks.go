@@ -92,12 +92,13 @@ func (a *APIHandler) APICreateFork(w http.ResponseWriter, r *http.Request) {
 	}
 	user := a.getAPIUser(r)
 	var userID primitive.ObjectID
-	var userEmail string
+	var userEmail, credential string
 	if user != nil {
 		userID, _ = primitive.ObjectIDFromHex(user.ID)
 		userEmail = user.Email
+		credential = user.Credential
 	}
-	fork, err := a.forkService.Create(r.Context(), body.Name, body.Description, userID, userEmail)
+	fork, err := a.forkService.CreateWithCredential(r.Context(), body.Name, body.Description, userID, userEmail, credential)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -194,6 +195,9 @@ func (a *APIHandler) APIForkPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if !a.mayWriteForkByID(w, r, forkID) {
+		return
+	}
 
 	var contentID primitive.ObjectID
 	if body.ContentID != "" {
@@ -238,6 +242,19 @@ func (a *APIHandler) APIForkPage(w http.ResponseWriter, r *http.Request) {
 		"title":     forkPage.Title,
 		"message":   fmt.Sprintf("Page '%s' added to fork. Use update_content with id='%s' to edit it.", forkPage.FullPath, forkPage.ID.Hex()),
 	})
+}
+
+// mayWriteForkByID loads a fork and applies callerMayWriteFork.
+func (a *APIHandler) mayWriteForkByID(w http.ResponseWriter, r *http.Request, forkID primitive.ObjectID) bool {
+	if !a.getAPIUser(r).Sandboxed() {
+		return true
+	}
+	fork, err := a.forkService.GetByID(r.Context(), forkID)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "fork not found")
+		return false
+	}
+	return a.callerMayWriteFork(w, r, fork)
 }
 
 // APIListForkPages lists all pages in a fork.
@@ -288,6 +305,9 @@ func (a *APIHandler) APIRemoveForkPage(w http.ResponseWriter, r *http.Request) {
 	pageID, err := primitive.ObjectIDFromHex(vars["pageID"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid page ID")
+		return
+	}
+	if !a.mayWriteForkByID(w, r, forkID) {
 		return
 	}
 	if err := a.forkService.RemovePage(r.Context(), forkID, pageID); err != nil {
@@ -445,14 +465,21 @@ func (a *APIHandler) APIPurgeForkCopies(w http.ResponseWriter, r *http.Request) 
 }
 
 // APIDeleteFork permanently deletes a fork and all its pages (admin only).
+//
+// A sandboxed caller may discard a fork it created, and no other; anyone else
+// needs fork.merge.
 func (a *APIHandler) APIDeleteFork(w http.ResponseWriter, r *http.Request) {
-	if !a.requirePermission(w, r, auth.PermForkMerge) {
-		return
-	}
 	vars := mux.Vars(r)
 	forkID, err := primitive.ObjectIDFromHex(vars["id"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid fork ID")
+		return
+	}
+	if a.getAPIUser(r).Sandboxed() {
+		if !a.requirePermission(w, r, auth.PermForkCreate) || !a.mayWriteForkByID(w, r, forkID) {
+			return
+		}
+	} else if !a.requirePermission(w, r, auth.PermForkMerge) {
 		return
 	}
 	if err := a.forkService.Delete(r.Context(), forkID); err != nil {

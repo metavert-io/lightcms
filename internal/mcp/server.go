@@ -15,7 +15,6 @@ import (
 type Server struct {
 	mcpServer *mcp.Server
 	client    *apiclient.Client
-	sandbox   sandboxState
 	// localFiles lets upload_asset read file_path from this machine's disk.
 	localFiles bool
 }

@@ -143,6 +143,39 @@ func (s *APIKeyService) deleteKey(ctx context.Context, filter bson.M) error {
 	return nil
 }
 
+// AccessSettings are what an API key or OAuth connection may do within its
+// owner's role: confined to its own forks (SandboxOnly) or not, and whether
+// it may merge the forks it created.
+type AccessSettings struct {
+	SandboxOnly      bool
+	CanMergeOwnForks bool
+}
+
+// GetAPIKey returns a key by ID.
+func (s *APIKeyService) GetAPIKey(ctx context.Context, id primitive.ObjectID) (*models.APIKey, error) {
+	var key models.APIKey
+	if err := s.db.FindOne(ctx, "api_keys", bson.M{"_id": id}, &key); err != nil {
+		return nil, ErrAPIKeyNotFound
+	}
+	return &key, nil
+}
+
+// UpdateAccess changes a key's access settings.
+func (s *APIKeyService) UpdateAccess(ctx context.Context, id primitive.ObjectID, settings AccessSettings) error {
+	return s.db.UpdateOne(ctx, "api_keys", bson.M{"_id": id}, bson.M{"$set": bson.M{
+		"sandbox_only":        settings.SandboxOnly,
+		"can_merge_own_forks": settings.CanMergeOwnForks,
+	}})
+}
+
+// SetActiveSandbox records the fork a key's sandbox writes to (nil: none).
+func (s *APIKeyService) SetActiveSandbox(ctx context.Context, id primitive.ObjectID, fork *primitive.ObjectID) error {
+	if fork == nil {
+		return s.db.UpdateOne(ctx, "api_keys", bson.M{"_id": id}, bson.M{"$unset": bson.M{"active_sandbox_fork": ""}})
+	}
+	return s.db.UpdateOne(ctx, "api_keys", bson.M{"_id": id}, bson.M{"$set": bson.M{"active_sandbox_fork": *fork}})
+}
+
 // AssignOwner gives a key with no owner on record to a user. It never changes
 // the owner of a key that already has one.
 func (s *APIKeyService) AssignOwner(ctx context.Context, id, ownerID primitive.ObjectID) error {

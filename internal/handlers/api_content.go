@@ -386,9 +386,9 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Sandbox-only keys must create inside a fork.
-	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && req.ForkID == "" {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: new content must be created inside a fork (set fork_id)")
+	// A sandboxed caller creates pages only inside its own forks.
+	if a.getAPIUser(r).Sandboxed() && req.ForkID == "" {
+		a.jsonError(w, http.StatusForbidden, sandboxRefusal)
 		return
 	}
 
@@ -412,6 +412,9 @@ func (a *APIHandler) APICreateContent(w http.ResponseWriter, r *http.Request) {
 		}
 		if fork.Status != "active" {
 			a.jsonError(w, http.StatusBadRequest, "fork is not active (status: "+fork.Status+")")
+			return
+		}
+		if !a.callerMayWriteFork(w, r, fork) {
 			return
 		}
 		forkID = &fid
@@ -498,9 +501,8 @@ func (a *APIHandler) APIUpdateContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sandbox-only keys may write to fork copies only, never live pages.
-	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
+	// A sandboxed caller edits copies in its own forks, never live pages.
+	if !a.callerMayWriteContent(w, r, content) {
 		return
 	}
 
@@ -1492,9 +1494,8 @@ func (a *APIHandler) APIUpdateContentByPath(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Sandbox-only keys may write to fork copies only, never live pages.
-	if u := a.getAPIUser(r); u != nil && u.SandboxOnly && content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, "this API key is sandbox-only: it can edit fork copies but not live content — fork the page first")
+	// A sandboxed caller edits copies in its own forks, never live pages.
+	if !a.callerMayWriteContent(w, r, content) {
 		return
 	}
 

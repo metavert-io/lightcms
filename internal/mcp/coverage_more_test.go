@@ -314,18 +314,6 @@ func TestSandbox_PassthroughAndFailureBranches(t *testing.T) {
 		t.Errorf("expected copy-on-write failure by ID, got: %v %s", res.IsError, resultText(t, res))
 	}
 
-	// Destructive tools that consult sandboxBlock are refused while active.
-	res = callTool(t, s, "revert_to_version", map[string]interface{}{"content_id": "live1", "version": 1})
-	if !strings.Contains(resultText(t, res), "BLOCKED") {
-		t.Errorf("revert_to_version should be blocked in sandbox: %s", resultText(t, res))
-	}
-	res = callTool(t, s, "bulk_create_content", map[string]interface{}{
-		"items": []map[string]interface{}{{"template_id": "t1", "title": "A", "slug": "a", "data": map[string]interface{}{}}},
-	})
-	if !strings.Contains(resultText(t, res), "BLOCKED") {
-		t.Errorf("bulk_create_content should be blocked in sandbox: %s", resultText(t, res))
-	}
-
 	// Diff backend failure: status and submit both surface the error.
 	state.mu.Lock()
 	state.diffFails = true

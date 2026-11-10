@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
@@ -72,6 +73,12 @@ func generatePreviewToken() (string, error) {
 
 // Create creates a new fork workspace.
 func (s *ForkService) Create(ctx context.Context, name, description string, userID primitive.ObjectID, userEmail string) (*models.ContentFork, error) {
+	return s.CreateWithCredential(ctx, name, description, userID, userEmail, "")
+}
+
+// CreateWithCredential creates a fork and records the API key or OAuth
+// connection that made it, which a sandboxed caller needs to write to it.
+func (s *ForkService) CreateWithCredential(ctx context.Context, name, description string, userID primitive.ObjectID, userEmail, credential string) (*models.ContentFork, error) {
 	token, err := generatePreviewToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate preview token: %w", err)
@@ -86,6 +93,8 @@ func (s *ForkService) Create(ctx context.Context, name, description string, user
 		CreatedBy:      userID,
 		CreatedByEmail: userEmail,
 		CreatedAt:      now,
+
+		CreatedByCredential: credential,
 	}
 	if _, err := s.db.InsertOne(ctx, "content_forks", fork); err != nil {
 		return nil, fmt.Errorf("insert fork: %w", err)
@@ -340,6 +349,7 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 	}}); err != nil {
 		return nil, fmt.Errorf("mark fork merged: %w", err)
 	}
+	s.releaseSandboxes(ctx, forkID)
 
 	// The copies have served their purpose: left behind they would only be
 	// stale duplicates of live pages. A failure here does not undo the merge —
@@ -371,10 +381,28 @@ func (s *ForkService) publishMerged(ctx context.Context, page *models.Content) s
 // Archive marks a fork as archived without merging.
 func (s *ForkService) Archive(ctx context.Context, forkID primitive.ObjectID) error {
 	now := time.Now()
-	return s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID, "status": "active"}, bson.M{"$set": bson.M{
+	if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID, "status": "active"}, bson.M{"$set": bson.M{
 		"status":      "archived",
 		"archived_at": now,
-	}})
+	}}); err != nil {
+		return err
+	}
+	s.releaseSandboxes(ctx, forkID)
+	return nil
+}
+
+// releaseSandboxes ends any API key's or connection's sandbox that writes to
+// a fork which is no longer open for work, so the credential is not left
+// confined to it. Failures are logged: GET /api/v1/sandbox clears a stale
+// sandbox too.
+func (s *ForkService) releaseSandboxes(ctx context.Context, forkID primitive.ObjectID) {
+	for _, collection := range []string{"api_keys", "oauth_grants"} {
+		if _, err := s.db.Collection(collection).UpdateMany(ctx,
+			bson.M{"active_sandbox_fork": forkID},
+			bson.M{"$unset": bson.M{"active_sandbox_fork": ""}}); err != nil {
+			log.Printf("Warning: failed to end sandboxes on fork %s in %s: %v", forkID.Hex(), collection, err)
+		}
+	}
 }
 
 // Delete permanently deletes a fork and all its pages. For a merged fork this
@@ -392,6 +420,7 @@ func (s *ForkService) Delete(ctx context.Context, forkID primitive.ObjectID) err
 	if _, err := s.db.Collection("content_forks").DeleteOne(ctx, bson.M{"_id": forkID}); err != nil {
 		return fmt.Errorf("delete fork: %w", err)
 	}
+	s.releaseSandboxes(ctx, forkID)
 	return nil
 }
 

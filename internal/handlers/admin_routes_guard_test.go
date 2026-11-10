@@ -36,6 +36,9 @@ var writeRoutesWithoutPermission = map[string]string{
 	"POST /cm/logout":          "public: only clears the caller's own session cookie",
 	"POST /cm/change-password": "session: the forced change of the signed-in user's own password",
 	"POST /cm/security":        "session: changes the signed-in user's own password and requires the current one",
+
+	"POST /cm/connected-apps/{id}/access": "session: a viewer can connect an app too; the handler refuses another person's connection below apikey.manage_all, and merging needs fork.merge",
+	"POST /cm/connected-apps/{id}/revoke": "session: anyone may disconnect their own app; the handler refuses another person's below apikey.manage_all",
 }
 
 var routeVarRe = regexp.MustCompile(`\{[^}]+\}`)
@@ -162,6 +165,11 @@ var adminRoleMatrix = map[string]string{
 	"GET /cm/security":           "*",
 	"POST /cm/security":          "*",
 	"GET /cm/forks/exit-preview": "*",
+
+	"GET /cm/connected-apps":              "*",
+	"POST /cm/connected-apps/{id}/access": "*",
+	"POST /cm/connected-apps/{id}/revoke": "*",
+	"POST /cm/api-keys/{id}/access":       "-cea",
 
 	// Templates and snippets: everyone reads, only admin writes
 	"GET /cm/templates":              "vcea",

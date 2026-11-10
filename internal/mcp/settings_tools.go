@@ -737,9 +737,6 @@ Example: {"version": 5}`,
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
-		if blocked := s.sandboxBlock("regenerate_all_content"); blocked != nil {
-			return blocked, nil, nil
-		}
 		if err := s.client.RegenerateAllContent(ctx); err != nil {
 			return errorResult(err), nil, nil
 		}

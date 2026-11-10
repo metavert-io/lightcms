@@ -297,6 +297,8 @@ func main() {
 		log.Printf("Removed the legacy system API key")
 	}
 
+	apiHandler.SetOAuthService(oauthService)
+	h.SetOAuthService(oauthService)
 	oauthHandler := oauth.NewHandler(oauthService, authManager, cfg.BaseURL, cfg.SessionSecret)
 
 	// Allow browser-based admin UI calls to /api/v1/ using session cookies (no Bearer token required).

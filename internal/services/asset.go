@@ -177,6 +177,20 @@ func (s *AssetService) GetAsset(ctx context.Context, id primitive.ObjectID) (*da
 	return asset, nil
 }
 
+// AssetExistsAt reports whether an asset is already stored at the serve path an
+// upload names, after the same normalisation UploadAsset applies.
+func (s *AssetService) AssetExistsAt(ctx context.Context, servePath string) (bool, error) {
+	p := filepath.Clean("/" + strings.TrimPrefix(servePath, "/"))
+	if strings.HasPrefix(p, "/assets/") {
+		p = strings.TrimPrefix(p, "/assets")
+	}
+	asset, err := s.db.GetAssetByPath(ctx, p)
+	if err != nil {
+		return false, err
+	}
+	return asset != nil, nil
+}
+
 // GetAssetByPath retrieves an asset by serve path
 func (s *AssetService) GetAssetByPath(ctx context.Context, path string) (*database.Asset, error) {
 	return s.db.GetAssetByPath(ctx, path)

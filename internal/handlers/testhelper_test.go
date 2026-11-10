@@ -216,6 +216,7 @@ func newTestHandler(t *testing.T) (*Handler, func()) {
 	h.SetForkService(services.NewForkService(db, contentService))
 	h.SetApprovalService(services.NewApprovalService(db, contentService, commentService, webhookService))
 	h.SetAnalyticsService(services.NewAnalyticsService(context.Background(), db, "http://localhost:8082"))
+	h.SetOAuthService(services.NewOAuthService(db))
 
 	cleanup := func() {
 		cleanupCollections(t, db)
@@ -373,6 +374,7 @@ func newTestAPIHandler(t *testing.T) (*APIHandler, *database.DB, func()) {
 	ah.SetImportService(services.NewImportService(db, contentService))
 	ah.SetUserService(services.NewUserService(db))
 	ah.SetApprovalService(services.NewApprovalService(db, contentService, commentService, webhookService))
+	ah.SetOAuthService(services.NewOAuthService(db))
 
 	cleanup := func() {
 		cleanupCollections(t, db)

@@ -4,48 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// sandboxState tracks the agent sandbox for this MCP session. While a
-// sandbox is active, all content writes are redirected into its fork —
-// live content is untouched until a human reviews and merges the fork.
-type sandboxState struct {
-	mu       sync.Mutex
-	forkID   string
-	forkName string
-}
-
-// sandboxFork returns the active sandbox fork, if any.
-func (s *Server) sandboxFork() (id, name string, active bool) {
-	s.sandbox.mu.Lock()
-	defer s.sandbox.mu.Unlock()
-	return s.sandbox.forkID, s.sandbox.forkName, s.sandbox.forkID != ""
-}
-
-// sandboxBlock returns a non-nil error result when a sandbox is active,
-// explaining why the tool is unavailable. Tools that publish, delete, or
-// bulk-modify live content call this first.
-func (s *Server) sandboxBlock(tool string) *mcp.CallToolResult {
-	forkID, forkName, active := s.sandboxFork()
-	if !active {
-		return nil
+// sandboxFork returns the caller's open sandbox, which the server keeps on the
+// API key or OAuth connection: the same in every MCP session, and kept across
+// restarts. When it cannot be read, writes are not redirected; the server
+// still refuses anything a sandboxed caller may not do.
+func (s *Server) sandboxFork(ctx context.Context) (id, name string, active bool) {
+	state, err := s.client.GetSandbox(ctx)
+	if err != nil || state == nil || !state.Active {
+		return "", "", false
 	}
-	return textResult(fmt.Sprintf(
-		"BLOCKED: %s is not available while agent sandbox %q (fork %s) is active. "+
-			"All changes must stay in the sandbox fork until a human reviews and merges it. "+
-			"Use update_content / create_content (they write into the sandbox automatically), "+
-			"then end_agent_sandbox to hand the fork off for review.",
-		tool, forkName, forkID))
+	return state.ForkID, state.Name, true
 }
 
 // sandboxTargetForContent resolves which content ID an update should hit
 // while a sandbox is active: fork copies pass through, live pages get a
 // copy-on-write fork copy, and pages from other forks are rejected.
 func (s *Server) sandboxTargetForContent(ctx context.Context, contentID string) (string, error) {
-	forkID, _, active := s.sandboxFork()
+	forkID, _, active := s.sandboxFork(ctx)
 	if !active {
 		return contentID, nil
 	}
@@ -71,7 +50,7 @@ func (s *Server) sandboxTargetForContent(ctx context.Context, contentID string) 
 // It returns the ID of the sandbox copy for the page at path ("" when no
 // sandbox is active, meaning: use the normal by-path flow).
 func (s *Server) sandboxTargetForPath(ctx context.Context, path string) (string, error) {
-	forkID, _, active := s.sandboxFork()
+	forkID, _, active := s.sandboxFork(ctx)
 	if !active {
 		return "", nil
 	}
@@ -98,13 +77,13 @@ func (s *Server) registerSandboxTools() {
 		Title: "Start Agent Sandbox",
 		Description: `Start a sandboxed editing session backed by a content fork ("pull request for content").
 
-While the sandbox is active:
-- update_content / update_content_by_path transparently copy pages into the fork and edit the copies (copy-on-write). Live content is never modified.
+The server records the sandbox on this API key or connection. Until it ends, every request from this key or connection is limited to the fork, in any session, and across restarts:
+- update_content / update_content_by_path copy pages into the fork and edit the copies (copy-on-write). Live content is not modified.
 - create_content creates new pages inside the fork.
-- Publishing, deleting, bulk operations, and search/replace-execute are blocked.
-- The site is unaffected until a human reviews the fork at /cm/forks and merges it.
+- Anything else that would change the live site is refused by the server.
+- The site is unaffected until the fork is merged at /cm/forks.
 
-Recommended for any multi-page or risky editing task. End with end_agent_sandbox.`,
+A key or connection set to Sandbox access is always limited to forks it created; it needs a sandbox (or create_fork) before it can change anything. On one with Full access the sandbox is an opt-in safety net. Recommended for any multi-page or risky editing task. End with end_agent_sandbox.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Start Agent Sandbox",
 			ReadOnlyHint:    false,
@@ -113,35 +92,19 @@ Recommended for any multi-page or risky editing task. End with end_agent_sandbox
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args StartAgentSandboxInput) (*mcp.CallToolResult, any, error) {
-		if _, name, active := s.sandboxFork(); active {
-			return textResult(fmt.Sprintf("A sandbox (%q) is already active. End it with end_agent_sandbox before starting another.", name)), nil, nil
-		}
-		name := args.Name
-		if name == "" {
-			name = "agent-session"
-		}
-		desc := args.Description
-		if desc == "" {
-			desc = "Agent sandbox session"
-		}
-		fork, err := s.client.CreateFork(ctx, name, desc)
+		state, err := s.client.StartSandbox(ctx, args.Name, args.Description)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
-		forkID, _ := fork["id"].(string)
-		if forkID == "" {
-			return textResult("fork created but no ID returned"), nil, nil
+		if state.ForkID == "" {
+			return textResult("sandbox started but no ID returned by the server"), nil, nil
 		}
-		s.sandbox.mu.Lock()
-		s.sandbox.forkID = forkID
-		s.sandbox.forkName = name
-		s.sandbox.mu.Unlock()
-
 		return jsonResult(map[string]interface{}{
-			"success": true,
-			"fork_id": forkID,
-			"name":    name,
-			"message": "Sandbox active. All content writes now go into this fork; live content is protected. Call end_agent_sandbox when done.",
+			"success":    true,
+			"fork_id":    state.ForkID,
+			"name":       state.Name,
+			"review_url": state.ReviewURL,
+			"message":    "Sandbox active. All content writes now go into this fork; live content is protected. Call end_agent_sandbox when done.",
 		}), nil, nil
 	})
 
@@ -149,25 +112,32 @@ Recommended for any multi-page or risky editing task. End with end_agent_sandbox
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "get_agent_sandbox",
 		Title:       "Get Agent Sandbox Status",
-		Description: "Show whether an agent sandbox is active, and if so its fork ID, name, and the pages changed so far (with per-field diffs against live).",
+		Description: "Show whether an agent sandbox is open for this API key or connection, and if so its fork ID, name, and the pages changed so far (with per-field diffs against live). Also says whether this key or connection is set to Sandbox access.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:        "Get Agent Sandbox Status",
 			ReadOnlyHint: true,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
-		forkID, name, active := s.sandboxFork()
-		if !active {
+		state, err := s.client.GetSandbox(ctx)
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
+		if !state.Active {
+			if state.Restricted {
+				return textResult("No agent sandbox is open. This connection is set to Sandbox access: it can change only forks it created, so start a sandbox with start_agent_sandbox before changing content."), nil, nil
+			}
 			return textResult("No agent sandbox is active. Content tools operate on live content."), nil, nil
 		}
-		diff, err := s.client.GetForkDiff(ctx, forkID)
+		diff, err := s.client.GetForkDiff(ctx, state.ForkID)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}
 		return jsonResult(map[string]interface{}{
-			"active":  true,
-			"fork_id": forkID,
-			"name":    name,
-			"changes": diff.Pages,
+			"active":     true,
+			"restricted": state.Restricted,
+			"fork_id":    state.ForkID,
+			"name":       state.Name,
+			"changes":    diff.Pages,
 		}), nil, nil
 	})
 
@@ -175,7 +145,7 @@ Recommended for any multi-page or risky editing task. End with end_agent_sandbox
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "end_agent_sandbox",
 		Title:       "End Agent Sandbox",
-		Description: `End the sandbox session. action='submit' keeps the fork for human review and merge (at /cm/forks/{id}); action='discard' permanently deletes the fork and all its changes. Agents cannot merge their own sandbox — merging is a human decision.`,
+		Description: `End the sandbox. action='submit' leaves the fork for review and merge (at /cm/forks/{id}); action='discard' permanently deletes the fork and all its changes. A key or connection set to Sandbox access stays limited to forks it created afterwards. Merging is a separate step (merge_fork) that a sandboxed connection can't take.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "End Agent Sandbox",
 			ReadOnlyHint:    false,
@@ -184,38 +154,42 @@ Recommended for any multi-page or risky editing task. End with end_agent_sandbox
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args EndAgentSandboxInput) (*mcp.CallToolResult, any, error) {
-		forkID, name, active := s.sandboxFork()
+		if args.Action != "submit" && args.Action != "discard" {
+			return textResult("action must be 'submit' or 'discard'"), nil, nil
+		}
+		forkID, name, active := s.sandboxFork(ctx)
 		if !active {
 			return textResult("No agent sandbox is active."), nil, nil
 		}
-		switch args.Action {
-		case "submit":
-			diff, err := s.client.GetForkDiff(ctx, forkID)
+		if args.Action == "discard" {
+			result, err := s.client.EndSandbox(ctx, "discard")
 			if err != nil {
 				return errorResult(err), nil, nil
 			}
-			s.sandbox.mu.Lock()
-			s.sandbox.forkID, s.sandbox.forkName = "", ""
-			s.sandbox.mu.Unlock()
-			return jsonResult(map[string]interface{}{
-				"success":    true,
-				"fork_id":    forkID,
-				"name":       name,
-				"changes":    diff.Pages,
-				"review_url": "/cm/forks/" + forkID,
-				"message":    "Sandbox submitted. A human can review the changes and merge the fork from the admin UI.",
-			}), nil, nil
-		case "discard":
-			if err := s.client.DeleteFork(ctx, forkID); err != nil {
-				return errorResult(err), nil, nil
+			msg := fmt.Sprintf("Sandbox %q discarded — fork and all its changes deleted. Live content was never modified.", name)
+			if restricted, _ := result["restricted"].(bool); restricted {
+				msg += " This connection is set to Sandbox access and can still change only forks it creates."
 			}
-			s.sandbox.mu.Lock()
-			s.sandbox.forkID, s.sandbox.forkName = "", ""
-			s.sandbox.mu.Unlock()
-			return textResult(fmt.Sprintf("Sandbox %q discarded — fork and all its changes deleted. Live content was never modified.", name)), nil, nil
-		default:
-			return textResult("action must be 'submit' or 'discard'"), nil, nil
+			return textResult(msg), nil, nil
 		}
+
+		diff, err := s.client.GetForkDiff(ctx, forkID)
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
+		result, err := s.client.EndSandbox(ctx, "submit")
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
+		return jsonResult(map[string]interface{}{
+			"success":    true,
+			"fork_id":    forkID,
+			"name":       name,
+			"changes":    diff.Pages,
+			"review_url": "/cm/forks/" + forkID,
+			"restricted": result["restricted"],
+			"message":    "Sandbox submitted. A person can review the changes and merge the fork from the admin UI.",
+		}), nil, nil
 	})
 
 	// Fork diff (also useful outside sandbox sessions, e.g. for reviewers)

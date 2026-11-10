@@ -251,6 +251,7 @@ func (h *Handler) AuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		templateData["UserEmail"] = user.Email
 		templateData["UserRole"] = user.Role
 		templateData["RoleSummary"] = roleSummary(user.Role)
+		templateData["CanGrantMerge"] = auth.HasPermission(user.Role, auth.PermForkMerge)
 		templateData["LoginUser"] = userID
 		templateData["LoginProof"] = h.computeLoginProof(userID, clientID, redirectURI, codeChallenge, resource, ts)
 		templateData["LoginTS"] = ts
@@ -277,7 +278,7 @@ func (h *Handler) AuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		grant, err := h.oauthService.SaveGrant(r.Context(), client, user.ID, resource)
+		grant, err := h.oauthService.SaveGrant(r.Context(), client, user.ID, resource, consentAccess(r, user))
 		if err != nil {
 			log.Printf("[OAuth] Failed to save grant: %v", err)
 			redirectWithError(w, r, redirectURI, state, "server_error", "Failed to record the connection")
@@ -437,6 +438,16 @@ func (h *Handler) approvingUser(r *http.Request, userID string) *models.User {
 		return nil
 	}
 	return user
+}
+
+// consentAccess reads the access chosen on the consent page. Anything but an
+// explicit "full" is Sandbox. Merging its own forks is granted only by someone
+// whose role can merge, which the person signing in here must be.
+func consentAccess(r *http.Request, user *models.User) services.AccessSettings {
+	return services.AccessSettings{
+		SandboxOnly:      r.FormValue("access") != "full",
+		CanMergeOwnForks: r.FormValue("can_merge_own_forks") == "1" && auth.HasPermission(user.Role, auth.PermForkMerge),
+	}
 }
 
 // resolveResource returns the resource an authorization request is for. A

@@ -356,16 +356,22 @@ func newMCPEnvironment(t *testing.T) *mcpEnvironment {
 	return &mcpEnvironment{url: srv.URL, db: db, users: users, oauth: oauth}
 }
 
-// connect signs person in through the OAuth service and returns the access
-// token and grant.
+// connect signs person in through the OAuth service with Full access and
+// returns the access token and grant.
 func (e *mcpEnvironment) connect(t *testing.T, person *models.User) (string, *models.OAuthGrant) {
+	t.Helper()
+	return e.connectWith(t, person, services.AccessSettings{})
+}
+
+// connectWith is connect with the given access settings.
+func (e *mcpEnvironment) connectWith(t *testing.T, person *models.User, access services.AccessSettings) (string, *models.OAuthGrant) {
 	t.Helper()
 	ctx := context.Background()
 	client, _, err := e.oauth.RegisterClient(ctx, "Test App", []string{"http://localhost/cb"})
 	if err != nil {
 		t.Fatalf("RegisterClient: %v", err)
 	}
-	grant, err := e.oauth.SaveGrant(ctx, client, person.ID, services.MCPResourceURL(mcpTestBaseURL))
+	grant, err := e.oauth.SaveGrant(ctx, client, person.ID, services.MCPResourceURL(mcpTestBaseURL), access)
 	if err != nil {
 		t.Fatalf("SaveGrant: %v", err)
 	}
@@ -377,11 +383,11 @@ func (e *mcpEnvironment) connect(t *testing.T, person *models.User) (string, *mo
 	if err != nil {
 		t.Fatalf("CreateAuthCode: %v", err)
 	}
-	access, _, _, err := e.oauth.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", verifier)
+	token, _, _, err := e.oauth.ExchangeAuthCode(ctx, code, client.ClientID, "http://localhost/cb", verifier)
 	if err != nil {
 		t.Fatalf("ExchangeAuthCode: %v", err)
 	}
-	return access, grant
+	return token, grant
 }
 
 func (e *mcpEnvironment) person(t *testing.T, email, role string) *models.User {
@@ -549,5 +555,53 @@ func TestEndToEnd_OAuthTokenRefusedAtTheRESTAPI(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("got %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestEndToEnd_SandboxConnectionWorksOnlyInItsOwnFork(t *testing.T) {
+	env := newMCPEnvironment(t)
+	tmpl := seedTemplate(t, env.db, "Page", "page")
+	live := seedContent(t, env.db, tmpl, "Live", "live", "/live")
+	token, _ := env.connectWith(t, env.person(t, "editor@example.com", models.RoleEditor), services.AccessSettings{SandboxOnly: true})
+	session := env.session(t, token)
+
+	// Without a sandbox, a Sandbox connection can't touch the live page.
+	result := callTool(t, session, "update_content", map[string]interface{}{"id": live.Hex(), "title": "Changed live"})
+	if !result.IsError || !strings.Contains(toolText(result), "limited to its own forks") {
+		t.Fatalf("live edit: %s", toolText(result))
+	}
+	if result := callTool(t, session, "get_agent_sandbox", map[string]interface{}{}); !strings.Contains(toolText(result), "set to Sandbox access") {
+		t.Errorf("status: %s", toolText(result))
+	}
+
+	if result := callTool(t, session, "start_agent_sandbox", map[string]interface{}{"name": "edits"}); result.IsError {
+		t.Fatalf("start_agent_sandbox: %s", toolText(result))
+	}
+	// A second session on the same connection is in the same sandbox.
+	second := env.session(t, token)
+	if result := callTool(t, second, "update_content", map[string]interface{}{"id": live.Hex(), "title": "Changed in the fork"}); result.IsError {
+		t.Fatalf("update in the sandbox: %s", toolText(result))
+	}
+	if result := callTool(t, second, "publish_content", map[string]interface{}{"id": live.Hex()}); !result.IsError {
+		t.Errorf("publishing from a sandbox: %s", toolText(result))
+	}
+
+	var page models.Content
+	env.db.FindOne(context.Background(), "content", bson.M{"_id": live}, &page)
+	if page.Title != "Live" {
+		t.Errorf("the live page changed to %q", page.Title)
+	}
+	var copies int64
+	copies, _ = env.db.Count(context.Background(), "content", bson.M{"full_path": "/live", "fork_id": bson.M{"$ne": nil}, "title": "Changed in the fork"})
+	if copies != 1 {
+		t.Errorf("%d fork copies carry the change, want 1", copies)
+	}
+
+	if result := callTool(t, session, "end_agent_sandbox", map[string]interface{}{"action": "submit"}); result.IsError {
+		t.Fatalf("submit: %s", toolText(result))
+	}
+	result = callTool(t, session, "update_content", map[string]interface{}{"id": live.Hex(), "title": "After submit"})
+	if !result.IsError {
+		t.Error("ending the sandbox lifted a Sandbox connection's restriction")
 	}
 }

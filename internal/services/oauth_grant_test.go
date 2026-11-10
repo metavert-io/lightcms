@@ -68,11 +68,11 @@ func TestSaveGrant_OneActiveGrantPerPersonAndClient(t *testing.T) {
 	ctx := context.Background()
 	user := primitive.NewObjectID()
 
-	first, err := f.svc.SaveGrant(ctx, f.client, user, testResource)
+	first, err := f.svc.SaveGrant(ctx, f.client, user, testResource, AccessSettings{})
 	if err != nil {
 		t.Fatalf("SaveGrant: %v", err)
 	}
-	again, err := f.svc.SaveGrant(ctx, f.client, user, testResource)
+	again, err := f.svc.SaveGrant(ctx, f.client, user, testResource, AccessSettings{})
 	if err != nil {
 		t.Fatalf("SaveGrant again: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestSaveGrant_OneActiveGrantPerPersonAndClient(t *testing.T) {
 		t.Error("approving the same client again should reuse the grant")
 	}
 
-	other, err := f.svc.SaveGrant(ctx, f.client, primitive.NewObjectID(), testResource)
+	other, err := f.svc.SaveGrant(ctx, f.client, primitive.NewObjectID(), testResource, AccessSettings{})
 	if err != nil {
 		t.Fatalf("SaveGrant other: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestSaveGrant_OneActiveGrantPerPersonAndClient(t *testing.T) {
 	if err := f.svc.RevokeGrant(ctx, first.ID); err != nil {
 		t.Fatalf("RevokeGrant: %v", err)
 	}
-	after, err := f.svc.SaveGrant(ctx, f.client, user, testResource)
+	after, err := f.svc.SaveGrant(ctx, f.client, user, testResource, AccessSettings{})
 	if err != nil {
 		t.Fatalf("SaveGrant after revoke: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestSaveGrant_ConcurrentApprovalsMakeOneGrant(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			grant, err := f.svc.SaveGrant(ctx, f.client, user, testResource)
+			grant, err := f.svc.SaveGrant(ctx, f.client, user, testResource, AccessSettings{})
 			if err != nil {
 				t.Errorf("SaveGrant: %v", err)
 				return
@@ -141,7 +141,7 @@ func TestSaveGrant_ConcurrentApprovalsMakeOneGrant(t *testing.T) {
 			t.Fatalf("RevokeGrant: %v", err)
 		}
 	}
-	if _, err := f.svc.SaveGrant(ctx, f.client, user, testResource); err != nil {
+	if _, err := f.svc.SaveGrant(ctx, f.client, user, testResource, AccessSettings{}); err != nil {
 		t.Errorf("reconnecting after a revoke: %v", err)
 	}
 }

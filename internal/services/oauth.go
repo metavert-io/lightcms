@@ -187,16 +187,23 @@ func (s *OAuthService) ValidateClientCredentials(ctx context.Context, clientID, 
 	return &client, nil
 }
 
-// SaveGrant records that a person approved a client, and returns the grant.
-// One person has one active grant per client: approving again reuses it.
-func (s *OAuthService) SaveGrant(ctx context.Context, client *models.OAuthClient, userID primitive.ObjectID, resource string) (*models.OAuthGrant, error) {
+// SaveGrant records that a person approved a client with the given access,
+// and returns the grant. One person has one active grant per client:
+// approving again reuses it with the access chosen this time.
+func (s *OAuthService) SaveGrant(ctx context.Context, client *models.OAuthClient, userID primitive.ObjectID, resource string, access AccessSettings) (*models.OAuthGrant, error) {
 	now := time.Now()
 	var grant models.OAuthGrant
 	save := func() error {
 		return s.db.Collection("oauth_grants").FindOneAndUpdate(ctx,
 			bson.M{"client_id": client.ClientID, "user_id": userID, "revoked_at": nil},
 			bson.M{
-				"$set":         bson.M{"client_name": client.ClientName, "resource": resource, "updated_at": now},
+				"$set": bson.M{
+					"client_name":         client.ClientName,
+					"resource":            resource,
+					"sandbox_only":        access.SandboxOnly,
+					"can_merge_own_forks": access.CanMergeOwnForks,
+					"updated_at":          now,
+				},
 				"$setOnInsert": bson.M{"created_at": now},
 			},
 			options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
@@ -220,6 +227,42 @@ func (s *OAuthService) GetGrant(ctx context.Context, id primitive.ObjectID) (*mo
 		return nil, fmt.Errorf("grant not found: %w", err)
 	}
 	return &grant, nil
+}
+
+// ListGrants returns the active connections, newest first: one person's when
+// userID is set, everyone's otherwise.
+func (s *OAuthService) ListGrants(ctx context.Context, userID *primitive.ObjectID) ([]models.OAuthGrant, error) {
+	filter := bson.M{"revoked_at": nil}
+	if userID != nil {
+		filter["user_id"] = *userID
+	}
+	cursor, err := s.db.FindMany(ctx, "oauth_grants", filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list connections: %w", err)
+	}
+	defer cursor.Close(ctx)
+	grants := []models.OAuthGrant{}
+	if err := cursor.All(ctx, &grants); err != nil {
+		return nil, fmt.Errorf("failed to decode connections: %w", err)
+	}
+	return grants, nil
+}
+
+// UpdateGrantAccess changes an active connection's access settings.
+func (s *OAuthService) UpdateGrantAccess(ctx context.Context, id primitive.ObjectID, access AccessSettings) error {
+	return s.db.UpdateOne(ctx, "oauth_grants", bson.M{"_id": id, "revoked_at": nil}, bson.M{"$set": bson.M{
+		"sandbox_only":        access.SandboxOnly,
+		"can_merge_own_forks": access.CanMergeOwnForks,
+		"updated_at":          time.Now(),
+	}})
+}
+
+// SetActiveSandbox records the fork a connection's sandbox writes to (nil: none).
+func (s *OAuthService) SetActiveSandbox(ctx context.Context, id primitive.ObjectID, fork *primitive.ObjectID) error {
+	if fork == nil {
+		return s.db.UpdateOne(ctx, "oauth_grants", bson.M{"_id": id}, bson.M{"$unset": bson.M{"active_sandbox_fork": ""}})
+	}
+	return s.db.UpdateOne(ctx, "oauth_grants", bson.M{"_id": id}, bson.M{"$set": bson.M{"active_sandbox_fork": *fork}})
 }
 
 // activeGrant returns a grant that has not been revoked.
