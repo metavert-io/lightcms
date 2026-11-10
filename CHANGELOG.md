@@ -4,6 +4,42 @@ All notable changes to LightCMS are documented here, organized by version.
 
 ---
 
+## [7.5.0] - 2026-11-09
+
+Agents now act as the person who connected them, the agent sandbox is enforced by the server, and merging an agent's own work is a permission an admin grants on purpose.
+
+### Upgrade notes
+- **Every OAuth connection has to sign in again once.** Tokens issued before 7.5.0 belong to no one and are refused. New connections start with **Sandbox** access: choose **Full** on the consent page, or later at Connected Apps, for an agent that should edit the live site directly.
+- **`merge_fork` through an API key or connection now needs a permission.** An admin turns on "Can merge its own forks" for the key (API Keys) or connection (Connected Apps), and it then merges only forks it created. Forks made before 7.5.0 have no recorded creator; a person merges them at `/cm/forks/{id}`. Every merge, by anyone, now needs the `digest` from the fork's diff.
+- **On first start the server deletes the "System (OAuth)" API key** and the stored copy of its value. Nothing else used it.
+- OAuth access tokens are accepted only at `/mcp`. `/mcp` no longer accepts a browser session.
+- `POST /api/v1/assets` no longer accepts `file_path`; send `data_base64`.
+
+### Security
+- **OAuth connections act as the person who signed in, not as an admin.** Tokens were exchanged for one stored admin key, so every connection had admin rights whoever approved it. A connection is now a grant naming the person, and each request loads their current role: a role change, a disabled account or a disconnected app takes effect at once. `/mcp` calls the REST API in-process as the caller, so no credential crosses a socket, and each MCP session is bound to the credential that opened it.
+- **Tokens are bound to this server's `/mcp` resource** (RFC 8707). Authorization codes and refresh tokens are single-use, atomically; a used refresh token that comes back ends the connection. `/oauth/revoke` revokes (it used to do nothing). Client registration is rate limited and size limited, and redirect URIs must be `https` or loopback. The consent page says who the app will act as and where it sends you back, and an account still on a temporary password can't connect apps.
+- **The agent sandbox is enforced by the server.** It was a variable in one MCP session: the REST API didn't know about it, ending it lifted every restriction, and webhooks, settings, theme, redirects, imports and approvals ignored it. Every key and connection is now **Sandbox** (it can change only forks it created) or **Full**. A default-deny table refuses every other write from a sandboxed caller, whichever tool sends it. Sandboxed uploads are limited to new images, PDFs, fonts and text. An open sandbox is recorded on the key or connection, so it holds across sessions and restarts.
+- **Merging is bound to what was reviewed.** The fork diff covers every field a merge writes, compares complete values (a change past the first 2,000 characters used to be invisible), and lists a new page's content. It returns a digest; the merge must send it and is refused if the fork or a live page it changes was edited since. Submitting a sandbox freezes its fork.
+- **An API key is refused when its owner is disabled or can't be loaded.** A failed owner lookup used to hand the key to the first admin permanently. Only a key with no owner on record is adopted, and it keeps its scopes and sandbox flag.
+- **Publishing needs `content.publish` on every path**: creating or updating with `published`, bulk create, imports, auto-publishing import sources, reverting to a version, restoring a deleted page, and merging with `publish_new`.
+- **Uploads no longer read files on the server.** `POST /api/v1/assets` read any `file_path` it was given, and on the hosted `/mcp` endpoint `upload_asset` read `file_path` from the server's disk. The stdio MCP binary still reads files from your own machine.
+
+### Added
+- **Connected Apps** (`/cm/connected-apps`): see, change and disconnect your OAuth connections; admins see everyone's.
+- **Access settings on API keys**: Sandbox or Full, and "Can merge its own forks" (admins only). New keys made in the admin UI are Sandbox.
+- **The review on the fork page**: `/cm/forks/{id}` shows every change field by field, with long values expandable, and merges exactly what it shows.
+- `GET /api/v1/sandbox`, `POST /api/v1/sandbox`, `POST /api/v1/sandbox/end`.
+
+### Changed
+- **Merges are recorded in page history and can be undone.** Each live page a merge creates or changes gets a version with who made the change; `rollback_agent_session` undoes a session's merge. A merged page's static file is rendered from the whole merged page, so its meta description, tags and author render as merged.
+- Changes made through `/mcp` are recorded as agent changes with a server-generated agent session; the audit log names the key or connection used.
+- Rate limits count per key or connection rather than per raw token.
+
+### Internal
+- The `/api/v1` routes moved from `cmd/server/main.go` to `internal/handlers/api_routes.go` (`MountAPI`), so tests can walk the real router.
+
+---
+
 ## [7.4.6] - 2026-11-06
 
 ### Fixed
