@@ -177,18 +177,28 @@ func (s *AssetService) GetAsset(ctx context.Context, id primitive.ObjectID) (*da
 	return asset, nil
 }
 
-// AssetExistsAt reports whether an asset is already stored at the serve path an
-// upload names, after the same normalisation UploadAsset applies.
+// AssetExistsAt reports whether the site already serves something at the serve
+// path an upload names, after the same normalisation UploadAsset applies: an
+// asset recorded with or without the /assets prefix (older uploads kept it),
+// or a file under content/generated at either location ServeAsset tries.
 func (s *AssetService) AssetExistsAt(ctx context.Context, servePath string) (bool, error) {
 	p := filepath.Clean("/" + strings.TrimPrefix(servePath, "/"))
 	if strings.HasPrefix(p, "/assets/") {
 		p = strings.TrimPrefix(p, "/assets")
 	}
-	asset, err := s.db.GetAssetByPath(ctx, p)
-	if err != nil {
-		return false, err
+	for _, candidate := range []string{p, "/assets" + p} {
+		asset, err := s.db.GetAssetByPath(ctx, candidate)
+		if err != nil {
+			return false, err
+		}
+		if asset != nil {
+			return true, nil
+		}
+		if info, err := os.Stat(filepath.Join("content/generated", candidate)); err == nil && !info.IsDir() {
+			return true, nil
+		}
 	}
-	return asset != nil, nil
+	return false, nil
 }
 
 // GetAssetByPath retrieves an asset by serve path

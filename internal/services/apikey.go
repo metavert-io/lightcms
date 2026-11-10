@@ -176,6 +176,18 @@ func (s *APIKeyService) SetActiveSandbox(ctx context.Context, id primitive.Objec
 	return s.db.UpdateOne(ctx, "api_keys", bson.M{"_id": id}, bson.M{"$set": bson.M{"active_sandbox_fork": *fork}})
 }
 
+// ClaimSandbox records fork as the key's sandbox only if none is open, and
+// reports whether it did.
+func (s *APIKeyService) ClaimSandbox(ctx context.Context, id, fork primitive.ObjectID) (bool, error) {
+	result, err := s.db.Collection("api_keys").UpdateOne(ctx,
+		bson.M{"_id": id, "active_sandbox_fork": nil},
+		bson.M{"$set": bson.M{"active_sandbox_fork": fork}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
 // AssignOwner gives a key with no owner on record to a user. It never changes
 // the owner of a key that already has one.
 func (s *APIKeyService) AssignOwner(ctx context.Context, id, ownerID primitive.ObjectID) error {

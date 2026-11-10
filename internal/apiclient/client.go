@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+// APIError is an error response from the REST API.
+type APIError struct {
+	Status  int
+	Message string
+}
+
+func (e *APIError) Error() string { return e.Message }
+
 // Client is an HTTP client for the LightCMS REST API
 type Client struct {
 	baseURL      string
@@ -103,9 +111,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-			return fmt.Errorf("%s", errResp.Error)
+			return &APIError{Status: resp.StatusCode, Message: errResp.Error}
 		}
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return &APIError{Status: resp.StatusCode, Message: fmt.Sprintf("API error (status %d): %s", resp.StatusCode, string(respBody))}
 	}
 
 	if result != nil {

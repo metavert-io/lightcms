@@ -3,28 +3,43 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+
+	"github.com/metavert-io/lightcms/v7/internal/apiclient"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // sandboxFork returns the caller's open sandbox, which the server keeps on the
 // API key or OAuth connection: the same in every MCP session, and kept across
-// restarts. When it cannot be read, writes are not redirected; the server
-// still refuses anything a sandboxed caller may not do.
-func (s *Server) sandboxFork(ctx context.Context) (id, name string, active bool) {
+// restarts. When the server can't say, it returns an error and the write
+// should stop: guessing "no sandbox" would send it to the live page. A server
+// without the sandbox endpoint (before 7.5) has no server-side sandbox.
+func (s *Server) sandboxFork(ctx context.Context) (id, name string, active bool, err error) {
 	state, err := s.client.GetSandbox(ctx)
-	if err != nil || state == nil || !state.Active {
-		return "", "", false
+	if err != nil {
+		var apiErr *apiclient.APIError
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+			return "", "", false, nil
+		}
+		return "", "", false, fmt.Errorf("could not check this connection's sandbox, so nothing was changed: %w", err)
 	}
-	return state.ForkID, state.Name, true
+	if !state.Active {
+		return "", "", false, nil
+	}
+	return state.ForkID, state.Name, true, nil
 }
 
 // sandboxTargetForContent resolves which content ID an update should hit
 // while a sandbox is active: fork copies pass through, live pages get a
 // copy-on-write fork copy, and pages from other forks are rejected.
 func (s *Server) sandboxTargetForContent(ctx context.Context, contentID string) (string, error) {
-	forkID, _, active := s.sandboxFork(ctx)
+	forkID, _, active, err := s.sandboxFork(ctx)
+	if err != nil {
+		return "", err
+	}
 	if !active {
 		return contentID, nil
 	}
@@ -50,7 +65,10 @@ func (s *Server) sandboxTargetForContent(ctx context.Context, contentID string) 
 // It returns the ID of the sandbox copy for the page at path ("" when no
 // sandbox is active, meaning: use the normal by-path flow).
 func (s *Server) sandboxTargetForPath(ctx context.Context, path string) (string, error) {
-	forkID, _, active := s.sandboxFork(ctx)
+	forkID, _, active, err := s.sandboxFork(ctx)
+	if err != nil {
+		return "", err
+	}
 	if !active {
 		return "", nil
 	}
@@ -157,7 +175,10 @@ A key or connection set to Sandbox access is always limited to forks it created;
 		if args.Action != "submit" && args.Action != "discard" {
 			return textResult("action must be 'submit' or 'discard'"), nil, nil
 		}
-		forkID, name, active := s.sandboxFork(ctx)
+		forkID, name, active, err := s.sandboxFork(ctx)
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
 		if !active {
 			return textResult("No agent sandbox is active."), nil, nil
 		}

@@ -265,6 +265,18 @@ func (s *OAuthService) SetActiveSandbox(ctx context.Context, id primitive.Object
 	return s.db.UpdateOne(ctx, "oauth_grants", bson.M{"_id": id}, bson.M{"$set": bson.M{"active_sandbox_fork": *fork}})
 }
 
+// ClaimSandbox records fork as the connection's sandbox only if none is open,
+// and reports whether it did.
+func (s *OAuthService) ClaimSandbox(ctx context.Context, id, fork primitive.ObjectID) (bool, error) {
+	result, err := s.db.Collection("oauth_grants").UpdateOne(ctx,
+		bson.M{"_id": id, "revoked_at": nil, "active_sandbox_fork": nil},
+		bson.M{"$set": bson.M{"active_sandbox_fork": fork}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
 // activeGrant returns a grant that has not been revoked.
 func (s *OAuthService) activeGrant(ctx context.Context, id primitive.ObjectID) (*models.OAuthGrant, error) {
 	if id.IsZero() {

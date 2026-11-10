@@ -391,7 +391,11 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		}
 
 		// Sandbox: create the page inside the sandbox fork instead of live.
-		if forkID, _, active := s.sandboxFork(ctx); active {
+		forkID, _, active, err := s.sandboxFork(ctx)
+		if err != nil {
+			return errorResult(err), nil, nil
+		}
+		if active {
 			if args.Upsert {
 				return textResult("upsert is not available while an agent sandbox is active — use update_content so the change stays in the sandbox fork"), nil, nil
 			}
@@ -501,13 +505,9 @@ Templates can use {{.lc_toc}} in their HTML layout to inject an auto-generated t
 		}
 
 		// Sandbox: redirect the write to the fork copy (copy-on-write).
-		targetID := args.ID
-		if _, _, active := s.sandboxFork(ctx); active {
-			tid, err := s.sandboxTargetForContent(ctx, args.ID)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-			targetID = tid
+		targetID, err := s.sandboxTargetForContent(ctx, args.ID)
+		if err != nil {
+			return errorResult(err), nil, nil
 		}
 
 		// For data fields, merge with existing content data
@@ -791,13 +791,9 @@ Only the fields you provide are changed. Always include a version_comment descri
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args UpdateContentByPathInput) (*mcp.CallToolResult, any, error) {
 		// Sandbox: copy-on-write the page into the fork and update the copy.
-		sandboxID := ""
-		if _, _, active := s.sandboxFork(ctx); active {
-			tid, err := s.sandboxTargetForPath(ctx, args.Path)
-			if err != nil {
-				return errorResult(err), nil, nil
-			}
-			sandboxID = tid
+		sandboxID, err := s.sandboxTargetForPath(ctx, args.Path)
+		if err != nil {
+			return errorResult(err), nil, nil
 		}
 
 		updates := map[string]interface{}{}
@@ -856,7 +852,6 @@ Only the fields you provide are changed. Always include a version_comment descri
 			updates["version_comment"] = args.VersionComment
 		}
 		var content *apiclient.Content
-		var err error
 		if sandboxID != "" {
 			content, err = s.client.UpdateContent(ctx, sandboxID, updates)
 		} else {

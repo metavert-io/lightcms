@@ -94,7 +94,7 @@ func (a *APIHandler) requirePermission(w http.ResponseWriter, r *http.Request, p
 	if !auth.UserHasPermission(user, perm) {
 		msg := "insufficient permissions"
 		if user.Sandboxed() && auth.HasPermission(user.Role, perm) {
-			msg = sandboxRefusal
+			msg = sandboxRefusalFor(user)
 		}
 		a.jsonError(w, http.StatusForbidden, msg)
 		return false

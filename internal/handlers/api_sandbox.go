@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 // sandboxWriteRoutes are the only /api/v1 routes that change state which a
@@ -27,7 +29,7 @@ var sandboxWriteRoutes = map[string]string{
 	"PUT /api/v1/content/by-path":              "edits a page copy in a fork the caller created",
 	"POST /api/v1/content/{id}/preview":        "renders a page without saving anything",
 	"POST /api/v1/content/export":              "reads content without changing it",
-	"POST /api/v1/content/{id}/comments":       "adds a comment for reviewers; comments are not shown on the site",
+	"POST /api/v1/content/{id}/comments":       "comments on a page copy in a fork the caller created (APICreateComment)",
 	"POST /api/v1/assets":                      "uploads a new image, PDF, font or text file; never replaces one, never HTML, JS, CSS or SVG",
 	"POST /api/v1/assets/from-url":             "the same, fetched from a URL",
 	"POST /api/v1/forks":                       "creates a fork owned by the caller",
@@ -40,6 +42,16 @@ var sandboxWriteRoutes = map[string]string{
 
 // sandboxRefusal is the error a sandboxed caller gets for anything outside its forks.
 const sandboxRefusal = "this connection is limited to its own forks. Start a sandbox (start_agent_sandbox, or POST /api/v1/sandbox) and make the change there for a person to review and merge"
+
+// sandboxRefusalFor explains a refusal to the caller: a Full key or connection
+// is held to its forks only while it has a sandbox open, and is told how to
+// end it.
+func sandboxRefusalFor(user *auth.SessionUser) string {
+	if user != nil && !user.SandboxOnly && user.ActiveSandboxFork != "" {
+		return "this connection has a sandbox open (fork " + user.ActiveSandboxFork + "), so it is limited to its own forks until the sandbox ends. Finish the work there, or end it with end_agent_sandbox (POST /api/v1/sandbox/end) to change the live site"
+	}
+	return sandboxRefusal
+}
 
 // SandboxGate refuses every state-changing request from a sandboxed caller
 // except the routes in sandboxWriteRoutes, whichever tool or client sent it.
@@ -57,7 +69,7 @@ func SandboxGate(next http.Handler) http.Handler {
 			template, _ = route.GetPathTemplate()
 		}
 		if _, ok := sandboxWriteRoutes[r.Method+" "+template]; !ok {
-			writeJSONError(w, http.StatusForbidden, sandboxRefusal)
+			writeJSONError(w, http.StatusForbidden, sandboxRefusalFor(user))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -95,7 +107,7 @@ func (a *APIHandler) callerMayWriteContent(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 	if content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, sandboxRefusal)
+		a.jsonError(w, http.StatusForbidden, sandboxRefusalFor(user))
 		return false
 	}
 	fork, err := a.forkService.GetByID(r.Context(), *content.ForkID)
@@ -163,23 +175,54 @@ func (a *APIHandler) setActiveSandbox(ctx context.Context, user *auth.SessionUse
 	return fmt.Errorf("unrecognised credential %q", user.Credential)
 }
 
-// activeSandbox returns the caller's open sandbox fork, or nil. A sandbox
-// whose fork has since been merged, archived or deleted is closed here.
-func (a *APIHandler) activeSandbox(ctx context.Context, user *auth.SessionUser) *models.ContentFork {
-	if user.ActiveSandboxFork == "" {
-		return nil
+// claimSandbox records fork as the caller's sandbox only if none is open, and
+// reports whether it did: of two requests racing to start a sandbox, one wins.
+func (a *APIHandler) claimSandbox(ctx context.Context, user *auth.SessionUser, fork primitive.ObjectID) (bool, error) {
+	kind, hexID, _ := strings.Cut(user.Credential, ":")
+	id, err := primitive.ObjectIDFromHex(hexID)
+	if err != nil {
+		return false, fmt.Errorf("unrecognised credential %q", user.Credential)
 	}
-	id, err := primitive.ObjectIDFromHex(user.ActiveSandboxFork)
-	if err == nil {
-		if fork, err := a.forkService.GetByID(ctx, id); err == nil && fork.Status == "active" {
-			return fork
+	switch kind {
+	case "apikey":
+		return a.apiKeyService.ClaimSandbox(ctx, id, fork)
+	case "oauth":
+		if a.oauthService == nil {
+			return false, fmt.Errorf("OAuth service unavailable")
+		}
+		return a.oauthService.ClaimSandbox(ctx, id, fork)
+	}
+	return false, fmt.Errorf("unrecognised credential %q", user.Credential)
+}
+
+// activeSandbox returns the caller's open sandbox fork, or nil when none is
+// open. A sandbox whose fork was deleted, or merged or archived, is closed
+// here. Any other error is returned and the sandbox is left as it is: a
+// passing database error must not lift it.
+func (a *APIHandler) activeSandbox(ctx context.Context, user *auth.SessionUser) (*models.ContentFork, error) {
+	if user.ActiveSandboxFork == "" {
+		return nil, nil
+	}
+	if id, err := primitive.ObjectIDFromHex(user.ActiveSandboxFork); err == nil {
+		fork, err := a.forkService.GetByID(ctx, id)
+		if err == nil && fork.Status == "active" {
+			return fork, nil
+		}
+		if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, fmt.Errorf("reading the sandbox fork: %w", err)
 		}
 	}
 	if err := a.setActiveSandbox(ctx, user, nil); err != nil {
-		fmt.Printf("Warning: failed to close a stale sandbox for %s: %v\n", user.Credential, err)
+		return nil, fmt.Errorf("closing a finished sandbox: %w", err)
 	}
 	user.ActiveSandboxFork = ""
-	return nil
+	return nil, nil
+}
+
+// sandboxUnavailable answers when the sandbox state can't be read.
+func (a *APIHandler) sandboxUnavailable(w http.ResponseWriter, err error) {
+	fmt.Printf("Warning: sandbox state unavailable: %v\n", err)
+	a.jsonError(w, http.StatusServiceUnavailable, "the sandbox state could not be read; try again")
 }
 
 func sandboxResponse(user *auth.SessionUser, fork *models.ContentFork) map[string]interface{} {
@@ -205,7 +248,12 @@ func (a *APIHandler) APIGetSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := a.getAPIUser(r)
-	a.jsonResponse(w, http.StatusOK, sandboxResponse(user, a.activeSandbox(r.Context(), user)))
+	fork, err := a.activeSandbox(r.Context(), user)
+	if err != nil {
+		a.sandboxUnavailable(w, err)
+		return
+	}
+	a.jsonResponse(w, http.StatusOK, sandboxResponse(user, fork))
 }
 
 // APIStartSandbox opens a sandbox: a new fork owned by the caller's key or
@@ -230,7 +278,12 @@ func (a *APIHandler) APIStartSandbox(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if open := a.activeSandbox(r.Context(), user); open != nil {
+	open, err := a.activeSandbox(r.Context(), user)
+	if err != nil {
+		a.sandboxUnavailable(w, err)
+		return
+	}
+	if open != nil {
 		a.jsonResponse(w, http.StatusConflict, map[string]interface{}{
 			"error":   fmt.Sprintf("a sandbox (%q) is already open; end it first", open.Name),
 			"fork_id": open.ID.Hex(),
@@ -250,9 +303,14 @@ func (a *APIHandler) APIStartSandbox(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := a.setActiveSandbox(r.Context(), user, &fork.ID); err != nil {
+	claimed, err := a.claimSandbox(r.Context(), user, fork.ID)
+	if err != nil || !claimed {
 		_ = a.forkService.Delete(r.Context(), fork.ID)
-		a.jsonError(w, http.StatusInternalServerError, "could not open the sandbox: "+err.Error())
+		if err != nil {
+			a.jsonError(w, http.StatusInternalServerError, "could not open the sandbox: "+err.Error())
+		} else {
+			a.jsonError(w, http.StatusConflict, "another sandbox was opened at the same time; end it first")
+		}
 		return
 	}
 	user.ActiveSandboxFork = fork.ID.Hex()
@@ -276,7 +334,11 @@ func (a *APIHandler) APIEndSandbox(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusBadRequest, `action must be "submit" or "discard"`)
 		return
 	}
-	fork := a.activeSandbox(r.Context(), user)
+	fork, err := a.activeSandbox(r.Context(), user)
+	if err != nil {
+		a.sandboxUnavailable(w, err)
+		return
+	}
 	if fork == nil {
 		a.jsonError(w, http.StatusConflict, "no sandbox is open")
 		return

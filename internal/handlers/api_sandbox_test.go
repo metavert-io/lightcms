@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
@@ -660,5 +661,93 @@ func TestAPIKeys_NewKeysAreSandboxAndAccessCanBeChanged(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Errorf("API keys page lacks %q", want)
 		}
+	}
+}
+
+func TestSandbox_ADatabaseErrorDoesNotEndTheSandbox(t *testing.T) {
+	a, db := newFaultAPIHandler(t)
+	ctx := context.Background()
+	users := services.NewUserService(db)
+	owner, err := users.CreateUserWithHash(ctx, "editor@example.com", "Editor", models.RoleEditor, "unused", false)
+	if err != nil {
+		t.Fatalf("CreateUserWithHash: %v", err)
+	}
+	keys := services.NewAPIKeyService(db)
+	raw, _, _ := keys.CreateScopedAPIKey(ctx, "Full", "", &owner.ID, nil, false)
+	resolver := auth.NewCredentialResolver(users, keys, services.NewOAuthService(db), "https://example.com/mcp", nil)
+	router := mux.NewRouter()
+	a.MountAPI(router, middleware.NewAPIAuth(resolver.ResolveAPIKey))
+	tmpl := seedTemplate(t, db, "Page", "page")
+	live := seedContent(t, db, tmpl, "Live", "live", "/live")
+
+	if rr := sendJSON(router, raw, "POST", "/api/v1/sandbox", `{}`); rr.Code != http.StatusCreated {
+		t.Fatalf("start: %d %s", rr.Code, rr.Body.String())
+	}
+	db.SetFaultHook(func(op, collection string) error {
+		if collection == "content_forks" {
+			return fmt.Errorf("injected outage")
+		}
+		return nil
+	})
+	if rr := sendJSON(router, raw, "GET", "/api/v1/sandbox", ``); rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("reading the sandbox during an outage: %d %s", rr.Code, rr.Body.String())
+	}
+	db.SetFaultHook(nil)
+
+	if state := decode(t, sendJSON(router, raw, "GET", "/api/v1/sandbox", ``)); state["active"] != true {
+		t.Errorf("the outage ended the sandbox: %+v", state)
+	}
+	if rr := sendJSON(router, raw, "PUT", "/api/v1/content/"+live.Hex(), `{"title":"Live change"}`); rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "has a sandbox open") {
+		t.Errorf("live edit with the sandbox still open: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSandbox_RacingStartsOpenOneSandbox(t *testing.T) {
+	e := newSandboxEnv(t)
+	key := e.key(t, "Agent", true)
+
+	codes := make(chan int, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- e.send(key, "POST", "/api/v1/sandbox", `{}`).Code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	created := 0
+	for code := range codes {
+		if code == http.StatusCreated {
+			created++
+		} else if code != http.StatusConflict {
+			t.Errorf("unexpected status %d", code)
+		}
+	}
+	if created != 1 {
+		t.Errorf("%d sandboxes opened, want 1", created)
+	}
+	if n, _ := e.db.Count(context.Background(), "content_forks", bson.M{"status": "active"}); n != 1 {
+		t.Errorf("%d active forks left behind, want 1", n)
+	}
+}
+
+func TestSandbox_CommentsOnlyOnPagesInItsOwnFork(t *testing.T) {
+	e := newSandboxEnv(t)
+	key := e.key(t, "Agent", true)
+	comment := `{"text":"Looks good"}`
+
+	if rr := e.send(key, "POST", "/api/v1/content/"+e.live.Hex()+"/comments", comment); rr.Code != http.StatusForbidden {
+		t.Errorf("comment on a live page: %d %s", rr.Code, rr.Body.String())
+	}
+	fork := e.startSandbox(t, key)
+	rr := e.send(key, "POST", "/api/v1/forks/"+fork+"/fork-page", `{"path":"/live"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fork-page: %d %s", rr.Code, rr.Body.String())
+	}
+	copyID := decode(t, rr)["id"].(string)
+	if rr := e.send(key, "POST", "/api/v1/content/"+copyID+"/comments", comment); rr.Code != http.StatusCreated {
+		t.Errorf("comment on its own copy: %d %s", rr.Code, rr.Body.String())
 	}
 }
