@@ -107,6 +107,11 @@ type ContentFork struct {
 	MergedBy            *primitive.ObjectID `bson:"merged_by,omitempty" json:"merged_by,omitempty"`
 	MergedByEmail       string              `bson:"merged_by_email,omitempty" json:"merged_by_email,omitempty"`
 	ArchivedAt          *time.Time          `bson:"archived_at,omitempty" json:"archived_at,omitempty"`
+	// SubmittedAt is when the fork was handed off for review (ending an
+	// agent sandbox with "submit"). From then on no API key or connection
+	// can change it; a person reviews, merges or archives it.
+	SubmittedAt      *time.Time `bson:"submitted_at,omitempty" json:"submitted_at,omitempty"`
+	SubmittedByEmail string     `bson:"submitted_by_email,omitempty" json:"submitted_by_email,omitempty"`
 	// Page counts recorded at merge time (v7.4). The fork's page copies are
 	// deleted after a successful merge, so these are the history of what it did.
 	MergedCreated int `bson:"merged_created,omitempty" json:"merged_created,omitempty"`

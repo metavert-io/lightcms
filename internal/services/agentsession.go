@@ -55,21 +55,36 @@ func (s *AgentSessionService) Changes(ctx context.Context, sessionID string) (*A
 	byContent := map[string]*AgentSessionChange{}
 	var order []string
 
+	touch := func(id, action string, at time.Time) *AgentSessionChange {
+		c, ok := byContent[id]
+		if !ok {
+			c = &AgentSessionChange{ContentID: id, FirstAt: at}
+			byContent[id] = c
+			order = append(order, id)
+		}
+		c.Actions = append(c.Actions, action)
+		c.LastAt = at
+		return c
+	}
+
 	for _, l := range logs {
+		if l.Action == "fork.merge" {
+			// A merge changes live pages through the fork: each page it
+			// created or updated is part of the session's changes.
+			for _, id := range stringList(l.Details["created_ids"]) {
+				touch(id, "fork.merge.create", l.CreatedAt)
+			}
+			for _, id := range stringList(l.Details["updated_ids"]) {
+				touch(id, "fork.merge.update", l.CreatedAt)
+			}
+		}
 		if l.Resource != "content" || l.ResourceID == "" {
 			if l.Resource != "" && l.Action != "" {
 				summary.OtherActions = append(summary.OtherActions, l.Action+" "+l.Resource+"/"+l.ResourceID)
 			}
 			continue
 		}
-		c, ok := byContent[l.ResourceID]
-		if !ok {
-			c = &AgentSessionChange{ContentID: l.ResourceID, FirstAt: l.CreatedAt}
-			byContent[l.ResourceID] = c
-			order = append(order, l.ResourceID)
-		}
-		c.Actions = append(c.Actions, l.Action)
-		c.LastAt = l.CreatedAt
+		c := touch(l.ResourceID, l.Action, l.CreatedAt)
 		if p, ok := l.Details["path"].(string); ok && p != "" {
 			c.Path = p
 		}
@@ -81,6 +96,26 @@ func (s *AgentSessionService) Changes(ctx context.Context, sessionID string) (*A
 		summary.ContentItems = append(summary.ContentItems, *byContent[id])
 	}
 	return summary, nil
+}
+
+// stringList reads a list of strings from an audit entry's details, as
+// stored ([]string) or as read back from the database ([]interface{}).
+func stringList(v interface{}) []string {
+	switch list := v.(type) {
+	case []string:
+		return list
+	case []interface{}:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case primitive.A:
+		return stringList([]interface{}(list))
+	}
+	return nil
 }
 
 // RollbackResult reports what a session rollback did per content item.
@@ -99,8 +134,10 @@ type RollbackSkipReason struct {
 
 // Rollback undoes a session's content changes: items the session created
 // are soft-deleted, deleted items are restored, and updated items revert
-// to their latest version predating the session's first touch. Non-content
-// changes (templates, settings, …) are reported but not auto-reverted.
+// to their latest version predating the session's first touch. Pages a
+// merge by the session created or updated count as created or updated by it.
+// Non-content changes (templates, settings, …) are reported but not
+// auto-reverted.
 func (s *AgentSessionService) Rollback(ctx context.Context, sessionID string) (*RollbackResult, error) {
 	summary, err := s.Changes(ctx, sessionID)
 	if err != nil {
@@ -123,7 +160,7 @@ func (s *AgentSessionService) Rollback(ctx context.Context, sessionID string) (*
 		created, deleted := false, false
 		for _, a := range item.Actions {
 			switch a {
-			case "content.create", "content.created":
+			case "content.create", "content.created", "fork.merge.create":
 				created = true
 			case "content.delete":
 				deleted = true

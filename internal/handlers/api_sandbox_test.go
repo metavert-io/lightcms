@@ -98,7 +98,6 @@ var sandboxRefusedRoutes = map[string]string{
 	"DELETE /api/v1/imports/sources/{id}":                 "import configuration",
 	"POST /api/v1/imports/sources/{id}/trigger":           "creates pages outside any fork",
 	"POST /api/v1/imports/jobs/{id}/cancel":               "stops someone else's import",
-	"POST /api/v1/forks/{id}/merge":                       "merging writes the live site",
 	"POST /api/v1/forks/{id}/archive":                     "ends a fork without review",
 	"POST /api/v1/forks/{id}/purge-copies":                "fork housekeeping",
 }
@@ -221,10 +220,16 @@ type sandboxEnv struct {
 
 func newSandboxEnv(t *testing.T) *sandboxEnv {
 	t.Helper()
+	return newSandboxEnvAs(t, models.RoleEditor)
+}
+
+// newSandboxEnvAs is newSandboxEnv with keys owned by an account of the given role.
+func newSandboxEnvAs(t *testing.T, role string) *sandboxEnv {
+	t.Helper()
 	a, db, cleanup := newTestAPIHandler(t)
 	t.Cleanup(cleanup)
 	users := services.NewUserService(db)
-	owner, err := users.CreateUserWithHash(context.Background(), "editor@example.com", "Editor", models.RoleEditor, "unused", false)
+	owner, err := users.CreateUserWithHash(context.Background(), role+"@example.com", "Owner", role, "unused", false)
 	if err != nil {
 		t.Fatalf("CreateUserWithHash: %v", err)
 	}

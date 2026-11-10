@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -140,11 +141,66 @@ func (h *Handler) ViewFork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pages, _ := h.forkService.ListPages(ctx, forkID)
-	h.renderAdmin(w, r, "fork_detail", map[string]interface{}{
+	data := map[string]interface{}{
 		"Fork":     fork,
 		"Pages":    pages,
 		"CanMerge": auth.HasPermission(user.Role, auth.PermForkMerge),
-	})
+	}
+	// The changes to review, and the digest the merge form sends back: the
+	// merge is refused if anything changes after this page was rendered.
+	if fork.Status == "active" {
+		if review, err := h.forkService.Review(ctx, forkID); err == nil {
+			data["Review"] = reviewView(review.Pages)
+			data["ReviewDigest"] = review.Digest
+		} else {
+			data["ReviewError"] = "The changes could not be compared with the live site: " + err.Error()
+		}
+	}
+	h.renderAdmin(w, r, "fork_detail", data)
+}
+
+// diffPreviewRunes is how much of a long value the review page shows before
+// "Show all".
+const diffPreviewRunes = 280
+
+type fieldView struct {
+	Name, Live, Fork          string
+	LivePreview, ForkPreview  string
+	LiveLong, ForkLong, IsNew bool
+}
+
+type pageReviewView struct {
+	Path, Title, Status string
+	Conflict            bool
+	Fields              []fieldView
+}
+
+// reviewView prepares a fork review for the page: complete values, with a
+// shortened preview of long ones (cut on a character boundary).
+func reviewView(pages []services.ForkPageDiff) []pageReviewView {
+	out := make([]pageReviewView, 0, len(pages))
+	for _, p := range pages {
+		v := pageReviewView{Path: p.Path, Title: p.Title, Status: p.Status, Conflict: p.Conflict}
+		for _, f := range p.Fields {
+			lp, ll := previewText(f.Live)
+			fp, fl := previewText(f.Fork)
+			v.Fields = append(v.Fields, fieldView{
+				Name: f.Name, Live: f.Live, Fork: f.Fork,
+				LivePreview: lp, ForkPreview: fp, LiveLong: ll, ForkLong: fl,
+				IsNew: p.Status == "added",
+			})
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func previewText(s string) (string, bool) {
+	runes := []rune(s)
+	if len(runes) <= diffPreviewRunes {
+		return s, false
+	}
+	return string(runes[:diffPreviewRunes]) + "…", true
 }
 
 // ---------------------------------------------------------------------------
@@ -324,14 +380,18 @@ func (h *Handler) MergeFork(w http.ResponseWriter, r *http.Request) {
 	}
 	r.ParseForm()
 	publishNew := r.FormValue("publish_new") == "on"
-	// Publishing new pages writes versions; stamp who did it.
+	// The merge writes versions; stamp who did it.
 	ctx := services.WithEditorEmail(r.Context(), user.Email)
 	ctx = services.WithProvenance(ctx, services.Provenance{Actor: "human", Via: "ui"})
 	userID, _ := primitive.ObjectIDFromHex(user.ID)
-	result, err := h.forkService.Merge(ctx, forkID, userID, user.Email, publishNew)
+	result, err := h.forkService.Merge(ctx, forkID, userID, user.Email, publishNew, r.FormValue("digest"))
 	if err != nil {
+		msg := err.Error()
+		if errors.Is(err, services.ErrForkChanged) || errors.Is(err, services.ErrReviewRequired) {
+			msg = "The fork, or a live page it changes, was edited after you opened it. Nothing was merged. Open the fork again to review the current changes."
+		}
 		h.renderAdmin(w, r, "fork_merge_result", map[string]interface{}{
-			"Error":  err.Error(),
+			"Error":  msg,
 			"ForkID": forkID.Hex(),
 		})
 		return
@@ -348,6 +408,8 @@ func (h *Handler) MergeFork(w http.ResponseWriter, r *http.Request) {
 				"created":     result.Created,
 				"conflicts":   len(result.Conflicts),
 				"publish_new": publishNew,
+				"created_ids": hexIDs(result.CreatedIDs),
+				"updated_ids": hexIDs(result.UpdatedIDs),
 			},
 		})
 	}

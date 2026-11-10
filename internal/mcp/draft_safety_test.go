@@ -172,13 +172,25 @@ func TestDraftSafety_MergeForkPublishNew(t *testing.T) {
 			"publish_new":true,"not_published":[{"id":"n2","path":"/held","reason":"on hold"}],"conflicts":[],"message":"ok"}`,
 	})
 
-	// Default: no publish_new in the request.
-	callTool(t, s, "merge_fork", map[string]interface{}{"fork_id": "f1"})
-	if c := lastCall(t, calls); c.Method != "POST" || c.Path != "/api/v1/forks/f1/merge" || c.Body["publish_new"] != nil {
+	// The digest is required: without one (or with an empty one) nothing is sent.
+	before := len(calls())
+	if !callToolExpectError(t, s, "merge_fork", map[string]interface{}{"fork_id": "f1"}) {
+		t.Error("merge_fork without a digest should fail")
+	}
+	if res := callTool(t, s, "merge_fork", map[string]interface{}{"fork_id": "f1", "digest": ""}); !res.IsError || !strings.Contains(resultText(t, res), "get_fork_diff") {
+		t.Errorf("merge_fork with an empty digest: %s", resultText(t, res))
+	}
+	if len(calls()) != before {
+		t.Error("a merge without a digest reached the API")
+	}
+
+	// Default: no publish_new in the request; the digest is sent.
+	callTool(t, s, "merge_fork", map[string]interface{}{"fork_id": "f1", "digest": "d1"})
+	if c := lastCall(t, calls); c.Method != "POST" || c.Path != "/api/v1/forks/f1/merge" || c.Body["publish_new"] != nil || c.Body["digest"] != "d1" {
 		t.Errorf("merge_fork default request: %s %s %v", c.Method, c.Path, c.Body)
 	}
 
-	res := callTool(t, s, "merge_fork", map[string]interface{}{"fork_id": "f1", "publish_new": true})
+	res := callTool(t, s, "merge_fork", map[string]interface{}{"fork_id": "f1", "publish_new": true, "digest": "d1"})
 	if c := lastCall(t, calls); c.Body["publish_new"] != true {
 		t.Errorf("merge_fork publish_new not sent: %v", c.Body)
 	}

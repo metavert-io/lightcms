@@ -36,6 +36,7 @@ var sandboxWriteRoutes = map[string]string{
 	"DELETE /api/v1/forks/{id}":                "discards a fork the caller created",
 	"POST /api/v1/forks/{id}/fork-page":        "copies a live page into a fork the caller created",
 	"DELETE /api/v1/forks/{id}/pages/{pageID}": "removes a page copy from a fork the caller created",
+	"POST /api/v1/forks/{id}/merge":            "merges only a fork the caller created, only with the merge permission, and only as reviewed (APIMergeFork)",
 	"POST /api/v1/sandbox":                     "starts a sandbox: a new fork owned by the caller",
 	"POST /api/v1/sandbox/end":                 "hands off or discards the caller's own sandbox fork",
 }
@@ -81,10 +82,16 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 }
 
 // callerMayWriteFork reports whether the caller may change pages in fork,
-// writing the refusal when not. A sandboxed caller may write only to an
-// active fork that it created.
+// writing the refusal when not. A fork submitted for review can't be changed
+// through an API key or connection; a person may still edit it, which
+// changes its review digest. A sandboxed caller may write only to an active
+// fork that it created.
 func (a *APIHandler) callerMayWriteFork(w http.ResponseWriter, r *http.Request, fork *models.ContentFork) bool {
 	user := a.getAPIUser(r)
+	if fork.SubmittedAt != nil && user != nil && user.Credential != "" {
+		a.jsonError(w, http.StatusConflict, "this fork was submitted for review and can't be changed any more; start a new sandbox for further changes")
+		return false
+	}
 	if !user.Sandboxed() {
 		return true
 	}
@@ -103,12 +110,12 @@ func (a *APIHandler) callerMayWriteFork(w http.ResponseWriter, r *http.Request, 
 // to; a sandboxed caller may not change a live page at all.
 func (a *APIHandler) callerMayWriteContent(w http.ResponseWriter, r *http.Request, content *models.Content) bool {
 	user := a.getAPIUser(r)
-	if !user.Sandboxed() {
-		return true
-	}
 	if content.ForkID == nil {
-		a.jsonError(w, http.StatusForbidden, sandboxRefusalFor(user))
-		return false
+		if user.Sandboxed() {
+			a.jsonError(w, http.StatusForbidden, sandboxRefusalFor(user))
+			return false
+		}
+		return true
 	}
 	fork, err := a.forkService.GetByID(r.Context(), *content.ForkID)
 	if err != nil {
@@ -349,6 +356,9 @@ func (a *APIHandler) APIEndSandbox(w http.ResponseWriter, r *http.Request) {
 			a.jsonError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+	} else if err := a.forkService.Submit(r.Context(), fork.ID, user.Email); err != nil {
+		a.jsonError(w, http.StatusInternalServerError, "could not submit the fork: "+err.Error())
+		return
 	}
 	if err := a.setActiveSandbox(r.Context(), user, nil); err != nil {
 		a.jsonError(w, http.StatusInternalServerError, "could not close the sandbox: "+err.Error())

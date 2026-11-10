@@ -39,7 +39,7 @@ func TestTools_Exercise(t *testing.T) {
 		{"get_fork", map[string]interface{}{"id": "f1"}},
 		{"fork_page", map[string]interface{}{"fork_id": "f1", "content_id": "c1"}},
 		{"remove_fork_page", map[string]interface{}{"fork_id": "f1", "page_id": "p1"}},
-		{"merge_fork", map[string]interface{}{"fork_id": "f1"}},
+		{"merge_fork", map[string]interface{}{"fork_id": "f1", "digest": "d1"}},
 		{"archive_fork", map[string]interface{}{"fork_id": "f1"}},
 		{"delete_fork", map[string]interface{}{"fork_id": "f1"}},
 		// Webhooks

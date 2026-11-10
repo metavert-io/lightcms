@@ -174,13 +174,18 @@ var sandboxAllowedPerms = map[string]bool{
 // UserHasPermission checks a permission against the user's role, then
 // narrows by the API key's scopes (when set) and sandbox-only restriction.
 func UserHasPermission(u *SessionUser, perm string) bool {
-	if u == nil {
-		return false
-	}
-	if !HasPermission(u.Role, perm) {
-		return false
-	}
 	if u.Sandboxed() && !sandboxAllowedPerms[perm] {
+		return false
+	}
+	return RoleAndScopesAllow(u, perm)
+}
+
+// RoleAndScopesAllow checks a permission against the user's role and the
+// API key's scopes, leaving the sandbox out. It is for the one step a
+// separate grant opens to a sandboxed caller: merging a fork it created
+// when CanMergeOwnForks is set.
+func RoleAndScopesAllow(u *SessionUser, perm string) bool {
+	if u == nil || !HasPermission(u.Role, perm) {
 		return false
 	}
 	if len(u.Scopes) > 0 {

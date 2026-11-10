@@ -249,7 +249,8 @@ func TestAdminLayout_ConfirmDeleteAndRevertAreTextSafe(t *testing.T) {
 }
 
 // Delete in the admin is a soft delete with Restore: no dialog may call it
-// irreversible. (Merging a fork really cannot be undone and still says so.)
+// irreversible. Since 7.5 a merge keeps each page's previous version, so its
+// confirmation says that instead of calling it irreversible.
 func TestAdminTemplates_DeleteWordingMatchesSoftDelete(t *testing.T) {
 	undone := regexp.MustCompile(`(?i)cannot be undone|can't be undone|permanently delet`)
 	for _, name := range sortedAdminTemplateNames() {
@@ -266,7 +267,8 @@ func TestAdminTemplates_DeleteWordingMatchesSoftDelete(t *testing.T) {
 	if !strings.Contains(form, "can be restored") {
 		t.Error("the Delete Page confirmation no longer says the page can be restored")
 	}
-	if !strings.Contains(adminTemplates["fork_detail"], "cannot be undone") {
-		t.Error("the fork merge confirmation lost its warning; a merge really cannot be undone")
+	merge := adminTemplates["fork_detail"]
+	if strings.Contains(merge, "cannot be undone") || !strings.Contains(merge, "previous version stays in its history") {
+		t.Error("the fork merge confirmation should say each page's previous version is kept, not that a merge cannot be undone")
 	}
 }

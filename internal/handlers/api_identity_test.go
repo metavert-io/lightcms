@@ -338,6 +338,7 @@ func newMCPEnvironment(t *testing.T) *mcpEnvironment {
 	t.Helper()
 	a, db, cleanup := newTestAPIHandler(t)
 	t.Cleanup(cleanup)
+	a.SetAgentSessionService(services.NewAgentSessionService(a.auditService, a.contentService))
 
 	users := services.NewUserService(db)
 	oauth := services.NewOAuthService(db)
@@ -603,5 +604,79 @@ func TestEndToEnd_SandboxConnectionWorksOnlyInItsOwnFork(t *testing.T) {
 	result = callTool(t, session, "update_content", map[string]interface{}{"id": live.Hex(), "title": "After submit"})
 	if !result.IsError {
 		t.Error("ending the sandbox lifted a Sandbox connection's restriction")
+	}
+}
+
+func TestEndToEnd_AnAgentMergesItsReviewedSandboxAndCanUndoIt(t *testing.T) {
+	env := newMCPEnvironment(t)
+	tmpl := seedTemplate(t, env.db, "Page", "page")
+	live := seedContent(t, env.db, tmpl, "Live", "live", "/live")
+	liveTitle := func() string {
+		var page models.Content
+		env.db.FindOne(context.Background(), "content", bson.M{"_id": live}, &page)
+		return page.Title
+	}
+	diffDigest := func(session *mcpsdk.ClientSession, fork string) string {
+		result := callTool(t, session, "get_fork_diff", map[string]interface{}{"id": fork})
+		var diff struct {
+			Digest string `json:"digest"`
+		}
+		if err := json.Unmarshal([]byte(toolText(result)), &diff); err != nil || diff.Digest == "" {
+			t.Fatalf("get_fork_diff: %s", toolText(result))
+		}
+		return diff.Digest
+	}
+	startAndEdit := func(session *mcpsdk.ClientSession, title string) string {
+		result := callTool(t, session, "start_agent_sandbox", map[string]interface{}{"name": "edits"})
+		var started struct {
+			ForkID string `json:"fork_id"`
+		}
+		if err := json.Unmarshal([]byte(toolText(result)), &started); err != nil || started.ForkID == "" {
+			t.Fatalf("start_agent_sandbox: %s", toolText(result))
+		}
+		if result := callTool(t, session, "update_content", map[string]interface{}{"id": live.Hex(), "title": title}); result.IsError {
+			t.Fatalf("update_content: %s", toolText(result))
+		}
+		return started.ForkID
+	}
+
+	// Without the merge permission, the agent hands off instead.
+	plainToken, _ := env.connect(t, env.person(t, "admin@example.com", models.RoleAdmin))
+	plain := env.session(t, plainToken)
+	fork := startAndEdit(plain, "Not merged")
+	result := callTool(t, plain, "merge_fork", map[string]interface{}{"fork_id": fork, "digest": diffDigest(plain, fork)})
+	if !result.IsError || !strings.Contains(toolText(result), "may not merge") {
+		t.Fatalf("merging without the permission: %s", toolText(result))
+	}
+	callTool(t, plain, "end_agent_sandbox", map[string]interface{}{"action": "discard"})
+
+	// With it, the agent merges what it reviewed, and its session can undo it.
+	token, _ := env.connectWith(t, env.person(t, "owner@example.com", models.RoleAdmin), services.AccessSettings{CanMergeOwnForks: true})
+	session := env.session(t, token)
+	fork = startAndEdit(session, "Merged by the agent")
+	digest := diffDigest(session, fork)
+	if result := callTool(t, session, "merge_fork", map[string]interface{}{"fork_id": fork, "digest": digest}); result.IsError {
+		t.Fatalf("merge_fork: %s", toolText(result))
+	}
+	if got := liveTitle(); got != "Merged by the agent" {
+		t.Fatalf("live title after merge: %q", got)
+	}
+
+	// The audit entry is written asynchronously; wait for it before rolling back.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, _ := env.db.Count(context.Background(), "audit_logs", bson.M{"action": "fork.merge", "resource_id": fork}); n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no audit entry for the merge")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if result := callTool(t, session, "rollback_agent_session", map[string]interface{}{}); result.IsError {
+		t.Fatalf("rollback_agent_session: %s", toolText(result))
+	}
+	if got := liveTitle(); got != "Live" {
+		t.Errorf("live title after rolling back the session: %q", got)
 	}
 }
