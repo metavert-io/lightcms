@@ -179,7 +179,7 @@ var oauthTemplates = map[string]string{
             <div class="consent-info">
                 <p><span class="client-name">{{.ClientName}}</span> wants to connect to this site as <strong>{{.UserEmail}}</strong>.</p>
                 <p class="access-note">After you approve, your browser goes to <strong>{{.RedirectHost}}</strong>. The app chose its own name, so continue only if you started this connection and you recognise that address.</p>
-                <p class="access-note">It will act with your {{.UserRole}} role: {{.RoleSummary}}. You can disconnect it at any time under Connected Apps.</p>
+                <p class="access-note">It will act with your {{.UserRole}} role: {{.RoleSummary}}.</p>
             </div>
             <form method="POST" action="/oauth/authorize">
                 <input type="hidden" name="client_id" value="{{.ClientID}}">

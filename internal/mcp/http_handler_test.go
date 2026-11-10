@@ -211,6 +211,22 @@ func TestHTTPHandler_SessionIsBoundToTheCredentialThatOpenedIt(t *testing.T) {
 	if resp := send("bob-token"); resp.StatusCode != http.StatusForbidden {
 		t.Errorf("another credential got %d, want 403", resp.StatusCode)
 	}
+
+	// The event stream and session deletion are bound the same way.
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		req, _ := http.NewRequest(method, srv.URL, nil)
+		req.Header.Set("Authorization", "Bearer bob-token")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Mcp-Session-Id", session.ID())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s with another credential: %d, want 403", method, resp.StatusCode)
+		}
+	}
 	if got := fake.lastCaller(); got != "" {
 		t.Errorf("a tool ran as %q on someone else's session", got)
 	}

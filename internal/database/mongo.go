@@ -64,6 +64,17 @@ func Connect(ctx context.Context, uri, dbName string, extraOpts ...*options.Clie
 	return db, nil
 }
 
+// OAuthGrantIndex is the unique index that allows one active OAuth grant per
+// person and client. SaveGrant inserts grants with revoked_at: null.
+func OAuthGrantIndex() mongo.IndexModel {
+	return mongo.IndexModel{
+		Keys: bson.D{{Key: "client_id", Value: 1}, {Key: "user_id", Value: 1}},
+		Options: options.Index().SetUnique(true).
+			SetPartialFilterExpression(bson.M{"revoked_at": bson.M{"$type": "null"}}).
+			SetName("one_active_grant_per_person_and_client"),
+	}
+}
+
 func (db *DB) createIndexes(ctx context.Context) error {
 	// Content full_path index (unique for live content only).
 	// Fork copies share the same full_path as their live counterpart, so the
@@ -294,6 +305,13 @@ func (db *DB) createIndexes(ctx context.Context) error {
 		Keys:    bson.D{{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(0),
 	})
+	if err != nil {
+		return err
+	}
+
+	// OAuth grants: one active grant per person and client. Revoking a grant
+	// sets revoked_at, which takes it out of the index.
+	_, err = db.database.Collection("oauth_grants").Indexes().CreateOne(ctx, OAuthGrantIndex())
 	if err != nil {
 		return err
 	}

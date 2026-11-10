@@ -161,6 +161,50 @@ func TestPublishPermission_UpdateRequiresItOnlyToChangeState(t *testing.T) {
 	}
 }
 
+func TestPublishPermission_RevertAndRestoreRequireItToChangeWhatIsLive(t *testing.T) {
+	a, db, cleanup := newTestAPIHandler(t)
+	defer cleanup()
+	router := apiRouterWithKeys(a, publishCallers())
+	tmpl := seedTemplate(t, db, "Page", "page").Hex()
+
+	// Version 1 is a published page; version 2 takes it down.
+	rr := sendJSON(router, "lc_editor", "POST", "/api/v1/content", fmt.Sprintf(`{"template_id":%q,"title":"T","slug":"revert-me","data":{},"published":true}`, tmpl))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rr.Code, rr.Body.String())
+	}
+	var page models.Content
+	json.Unmarshal(rr.Body.Bytes(), &page)
+	id := page.ID.Hex()
+	if rr := sendJSON(router, "lc_editor", "PUT", "/api/v1/content/"+id, `{"published":false}`); rr.Code != http.StatusOK {
+		t.Fatalf("unpublish: %d %s", rr.Code, rr.Body.String())
+	}
+
+	if rr := sendJSON(router, "lc_writer", "POST", "/api/v1/content/"+id+"/versions/1/revert", `{}`); rr.Code != http.StatusForbidden {
+		t.Errorf("reverting to a published version: %d %s", rr.Code, rr.Body.String())
+	}
+	if _, published := pagePublished(t, db, "revert-me"); published {
+		t.Fatal("the revert published the page")
+	}
+	// Reverting to a version in the same state is an ordinary edit.
+	if rr := sendJSON(router, "lc_writer", "POST", "/api/v1/content/"+id+"/versions/2/revert", `{}`); rr.Code != http.StatusOK {
+		t.Errorf("reverting within the same state: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// A page that was live when it was deleted comes back live on restore.
+	if rr := sendJSON(router, "lc_editor", "PUT", "/api/v1/content/"+id, `{"published":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("republish: %d %s", rr.Code, rr.Body.String())
+	}
+	if err := a.contentService.DeleteContent(context.Background(), page.ID); err != nil {
+		t.Fatalf("DeleteContent: %v", err)
+	}
+	if rr := sendJSON(router, "lc_writer", "POST", "/api/v1/content/"+id+"/restore", ``); rr.Code != http.StatusForbidden {
+		t.Errorf("restoring a page that was live: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := sendJSON(router, "lc_editor", "POST", "/api/v1/content/"+id+"/restore", ``); rr.Code != http.StatusOK {
+		t.Errorf("editor restoring: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestPublishedField_IgnoredOnForkCopies(t *testing.T) {
 	a, db, cleanup := newTestAPIHandler(t)
 	defer cleanup()

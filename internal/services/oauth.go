@@ -32,7 +32,7 @@ const (
 	// use is refused without ending the connection. Two requests from one
 	// client racing to refresh are not an attack; a used token that comes back
 	// later is.
-	RefreshReuseLeeway = 30 * time.Second
+	RefreshReuseLeeway = 10 * time.Second
 
 	// grantTouchInterval limits how often a grant's last-used time is written.
 	grantTouchInterval = time.Minute
@@ -192,14 +192,21 @@ func (s *OAuthService) ValidateClientCredentials(ctx context.Context, clientID, 
 func (s *OAuthService) SaveGrant(ctx context.Context, client *models.OAuthClient, userID primitive.ObjectID, resource string) (*models.OAuthGrant, error) {
 	now := time.Now()
 	var grant models.OAuthGrant
-	err := s.db.Collection("oauth_grants").FindOneAndUpdate(ctx,
-		bson.M{"client_id": client.ClientID, "user_id": userID, "revoked_at": nil},
-		bson.M{
-			"$set":         bson.M{"client_name": client.ClientName, "resource": resource, "updated_at": now},
-			"$setOnInsert": bson.M{"created_at": now},
-		},
-		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
-	).Decode(&grant)
+	save := func() error {
+		return s.db.Collection("oauth_grants").FindOneAndUpdate(ctx,
+			bson.M{"client_id": client.ClientID, "user_id": userID, "revoked_at": nil},
+			bson.M{
+				"$set":         bson.M{"client_name": client.ClientName, "resource": resource, "updated_at": now},
+				"$setOnInsert": bson.M{"created_at": now},
+			},
+			options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+		).Decode(&grant)
+	}
+	err := save()
+	if mongo.IsDuplicateKeyError(err) {
+		// Another approval inserted the grant first; update that one.
+		err = save()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to save grant: %w", err)
 	}
@@ -449,6 +456,10 @@ func (s *OAuthService) ValidateAccessToken(ctx context.Context, rawToken, resour
 // generateTokenPair creates and stores a new access token + refresh token
 func (s *OAuthService) generateTokenPair(ctx context.Context, grant *models.OAuthGrant) (string, string, int, error) {
 	rawAccess, err := generateToken(48)
+	// Bearer tokens that start with "lc_" are taken to be API keys.
+	for err == nil && strings.HasPrefix(rawAccess, "lc_") {
+		rawAccess, err = generateToken(48)
+	}
 	if err != nil {
 		return "", "", 0, fmt.Errorf("failed to generate access token: %w", err)
 	}

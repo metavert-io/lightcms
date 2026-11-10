@@ -100,6 +100,65 @@ func TestSaveGrant_OneActiveGrantPerPersonAndClient(t *testing.T) {
 	}
 }
 
+func TestSaveGrant_ConcurrentApprovalsMakeOneGrant(t *testing.T) {
+	f := newOAuthFixture(t)
+	ctx := context.Background()
+	if _, err := f.db.Collection("oauth_grants").Indexes().CreateOne(ctx, database.OAuthGrantIndex()); err != nil {
+		t.Fatalf("creating index: %v", err)
+	}
+	user := primitive.NewObjectID()
+
+	var wg sync.WaitGroup
+	ids := make(chan primitive.ObjectID, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			grant, err := f.svc.SaveGrant(ctx, f.client, user, testResource)
+			if err != nil {
+				t.Errorf("SaveGrant: %v", err)
+				return
+			}
+			ids <- grant.ID
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	seen := map[primitive.ObjectID]bool{}
+	for id := range ids {
+		seen[id] = true
+	}
+	if len(seen) != 1 {
+		t.Errorf("%d grants for one person and client, want 1", len(seen))
+	}
+	if n, _ := f.db.Count(ctx, "oauth_grants", bson.M{"user_id": user, "revoked_at": nil}); n != 1 {
+		t.Errorf("%d active grants stored, want 1", n)
+	}
+
+	// A revoked grant leaves the index, so the person can connect again.
+	for id := range seen {
+		if err := f.svc.RevokeGrant(ctx, id); err != nil {
+			t.Fatalf("RevokeGrant: %v", err)
+		}
+	}
+	if _, err := f.svc.SaveGrant(ctx, f.client, user, testResource); err != nil {
+		t.Errorf("reconnecting after a revoke: %v", err)
+	}
+}
+
+func TestGenerateTokenPair_AccessTokenNeverLooksLikeAnAPIKey(t *testing.T) {
+	f := newOAuthFixture(t)
+	for i := 0; i < 50; i++ {
+		access, _, _, err := f.svc.generateTokenPair(context.Background(), f.grant)
+		if err != nil {
+			t.Fatalf("generateTokenPair: %v", err)
+		}
+		if strings.HasPrefix(access, "lc_") {
+			t.Fatalf("access token %q starts like an API key", access)
+		}
+	}
+}
+
 func TestValidateAccessToken(t *testing.T) {
 	f := newOAuthFixture(t)
 	ctx := context.Background()
