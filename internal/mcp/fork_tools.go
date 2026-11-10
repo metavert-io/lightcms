@@ -31,6 +31,7 @@ type RemoveForkPageInput struct {
 
 type MergeForkInput struct {
 	ForkID     string `json:"fork_id" jsonschema:"Fork workspace ID to merge into live,required"`
+	Digest     string `json:"digest" jsonschema:"The digest get_fork_diff returned for the changes you reviewed. The merge is refused if the fork or a page it changes was edited since,required"`
 	PublishNew bool   `json:"publish_new,omitempty" jsonschema:"Also publish the pages this merge creates. Default false: new pages keep the publish state they had in the fork (normally draft). Pages on hold always stay drafts"`
 }
 
@@ -182,13 +183,17 @@ If the page is already in this fork, returns the existing fork copy.`,
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:  "merge_fork",
 		Title: "Merge Fork",
-		Description: `Merge all pages in a fork workspace into live content. Requires admin role.
+		Description: `Merge all pages in a fork workspace into live content, exactly as reviewed.
+
+Call get_fork_diff first, review (and show the user) the changes, and pass its digest. The merge is refused if the fork, or a live page it changes, was edited after that diff was taken: review again and use the new digest.
+
+Who can merge: a person whose role can merge, at /cm/forks/{id}. An API key or connection (this tool) can merge only a fork it created itself, and only when an admin has allowed it to merge its own forks under API Keys or Connected Apps, and only while its owner's role can merge. Anything else is refused: a person merges it.
 
 For each page in the fork:
 - If a matching live page exists (same URL): updates it with the fork content (fork wins). If the live page was edited after the fork was created, records a conflict but still merges.
 - If no live page exists at that URL: creates a new live page. It keeps the publish state it had in the fork (normally draft) unless publish_new is true, which publishes it. Pages on hold always stay drafts.
 
-After merging, the fork status changes to "merged", its page copies are deleted, and the created/updated counts are kept on the fork record. Published live pages are regenerated immediately.
+Each live page the merge creates or changes gets a version in its history, so it can be reverted; rollback_agent_session undoes a merge made in that session. After merging, the fork status changes to "merged", its page copies are deleted, and the created/updated counts are kept on the fork record. Published live pages are regenerated immediately.
 
 Returns: updated and created counts, created_ids and updated_ids (live page IDs), not_published (new pages publish_new left as drafts, with the reason), and any conflicts detected.
 
@@ -201,7 +206,10 @@ ALWAYS confirm with the user before merging, as this pushes changes to the live 
 			OpenWorldHint:   boolPtr(false),
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args MergeForkInput) (*mcp.CallToolResult, any, error) {
-		result, err := s.client.MergeFork(ctx, args.ForkID, args.PublishNew)
+		if args.Digest == "" {
+			return errorResult(fmt.Errorf("digest is required: call get_fork_diff, review the changes, and pass its digest")), nil, nil
+		}
+		result, err := s.client.MergeFork(ctx, args.ForkID, args.PublishNew, args.Digest)
 		if err != nil {
 			return errorResult(err), nil, nil
 		}

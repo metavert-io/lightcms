@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -244,11 +245,39 @@ func (a *APIHandler) APIForkPage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// credentialMayMerge applies the rules for a merge through an API key or
+// connection, writing the refusal when they don't hold.
+func (a *APIHandler) credentialMayMerge(w http.ResponseWriter, r *http.Request, caller *auth.SessionUser, forkID primitive.ObjectID, publishNew bool) bool {
+	if !auth.RoleAndScopesAllow(caller, auth.PermForkMerge) {
+		a.jsonError(w, http.StatusForbidden, "insufficient permissions")
+		return false
+	}
+	if !caller.CanMergeOwnForks {
+		a.jsonError(w, http.StatusForbidden, "this API key or connection may not merge forks. An admin can let it merge forks it creates, under API Keys or Connected Apps; otherwise a person merges at /cm/forks/"+forkID.Hex())
+		return false
+	}
+	fork, err := a.forkService.GetByID(r.Context(), forkID)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "fork not found")
+		return false
+	}
+	if fork.CreatedByCredential == "" || fork.CreatedByCredential != caller.Credential {
+		a.jsonError(w, http.StatusForbidden, "this API key or connection can merge only forks it created; a person merges this one at /cm/forks/"+forkID.Hex())
+		return false
+	}
+	if fork.SubmittedAt != nil {
+		a.jsonError(w, http.StatusForbidden, "this fork was submitted for review, which hands it to a person: they merge it at /cm/forks/"+forkID.Hex())
+		return false
+	}
+	if publishNew && !auth.RoleAndScopesAllow(caller, auth.PermContentPublish) {
+		a.jsonError(w, http.StatusForbidden, "insufficient permissions to publish new pages")
+		return false
+	}
+	return true
+}
+
 // mayWriteForkByID loads a fork and applies callerMayWriteFork.
 func (a *APIHandler) mayWriteForkByID(w http.ResponseWriter, r *http.Request, forkID primitive.ObjectID) bool {
-	if !a.getAPIUser(r).Sandboxed() {
-		return true
-	}
 	fork, err := a.forkService.GetByID(r.Context(), forkID)
 	if err != nil {
 		a.jsonError(w, http.StatusNotFound, "fork not found")
@@ -317,13 +346,13 @@ func (a *APIHandler) APIRemoveForkPage(w http.ResponseWriter, r *http.Request) {
 	a.jsonResponse(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
-// APIMergeFork merges all fork pages into live (admin only).
-// Optional body: {"publish_new": true} also publishes the pages the merge
-// creates (held pages stay drafts). The body may be omitted.
+// APIMergeFork merges all fork pages into live.
+//
+// A person (browser session) needs fork.merge. An API key or OAuth connection
+// may merge only a fork it created, only when an admin has allowed it to
+// merge its own forks, and only while its owner's role can merge. Every merge
+// names the review it was approved from: the digest from the fork's diff.
 func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
-	if !a.requirePermission(w, r, auth.PermForkMerge) {
-		return
-	}
 	vars := mux.Vars(r)
 	forkID, err := primitive.ObjectIDFromHex(vars["id"])
 	if err != nil {
@@ -331,7 +360,8 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		PublishNew bool `json:"publish_new"`
+		PublishNew bool   `json:"publish_new"`
+		Digest     string `json:"digest"`
 	}
 	if raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20)); len(raw) > 0 {
 		if err := json.Unmarshal(raw, &body); err != nil {
@@ -339,9 +369,26 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.PublishNew && !a.requirePermission(w, r, auth.PermContentPublish) {
+
+	caller := a.getAPIUser(r)
+	selfMerge := caller != nil && caller.Credential != ""
+	if selfMerge {
+		if !a.credentialMayMerge(w, r, caller, forkID, body.PublishNew) {
+			return
+		}
+	} else {
+		if !a.requirePermission(w, r, auth.PermForkMerge) {
+			return
+		}
+		if body.PublishNew && !a.requirePermission(w, r, auth.PermContentPublish) {
+			return
+		}
+	}
+	if body.Digest == "" {
+		a.jsonError(w, http.StatusBadRequest, "digest is required: review the fork with GET /api/v1/forks/"+forkID.Hex()+"/diff and send its digest")
 		return
 	}
+
 	user := a.getAPIUser(r)
 	var userID primitive.ObjectID
 	var userEmail string
@@ -349,7 +396,11 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 		userID, _ = primitive.ObjectIDFromHex(user.ID)
 		userEmail = user.Email
 	}
-	result, err := a.forkService.Merge(r.Context(), forkID, userID, userEmail, body.PublishNew)
+	result, err := a.forkService.Merge(r.Context(), forkID, userID, userEmail, body.PublishNew, body.Digest)
+	if errors.Is(err, services.ErrForkChanged) || errors.Is(err, services.ErrReviewRequired) {
+		a.jsonError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -359,6 +410,9 @@ func (a *APIHandler) APIMergeFork(w http.ResponseWriter, r *http.Request) {
 		"created":     result.Created,
 		"conflicts":   len(result.Conflicts),
 		"publish_new": body.PublishNew,
+		"self_merge":  selfMerge,
+		"created_ids": hexIDs(result.CreatedIDs),
+		"updated_ids": hexIDs(result.UpdatedIDs),
 	})
 
 	type conflictSummary struct {
@@ -410,6 +464,9 @@ func (a *APIHandler) APIArchiveFork(w http.ResponseWriter, r *http.Request) {
 	forkID, err := primitive.ObjectIDFromHex(vars["id"])
 	if err != nil {
 		a.jsonError(w, http.StatusBadRequest, "invalid fork ID")
+		return
+	}
+	if !a.mayWriteForkByID(w, r, forkID) {
 		return
 	}
 	if err := a.forkService.Archive(r.Context(), forkID); err != nil {
@@ -479,7 +536,7 @@ func (a *APIHandler) APIDeleteFork(w http.ResponseWriter, r *http.Request) {
 		if !a.requirePermission(w, r, auth.PermForkCreate) || !a.mayWriteForkByID(w, r, forkID) {
 			return
 		}
-	} else if !a.requirePermission(w, r, auth.PermForkMerge) {
+	} else if !a.requirePermission(w, r, auth.PermForkMerge) || !a.mayWriteForkByID(w, r, forkID) {
 		return
 	}
 	if err := a.forkService.Delete(r.Context(), forkID); err != nil {
@@ -502,14 +559,17 @@ func (a *APIHandler) APIForkDiff(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusBadRequest, "invalid fork ID")
 		return
 	}
-	diffs, err := a.forkService.Diff(r.Context(), forkID)
+	review, err := a.forkService.Review(r.Context(), forkID)
 	if err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	resp := map[string]interface{}{
 		"fork_id": forkID.Hex(),
-		"pages":   diffs,
+		"pages":   review.Pages,
+		// The merge must send this back: it is refused if the fork or a page
+		// it changes is edited after this diff was taken.
+		"digest": review.Digest,
 	}
 	// After a merge there are no copies left to diff; report what it did.
 	if fork, err := a.forkService.GetByID(r.Context(), forkID); err == nil {

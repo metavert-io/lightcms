@@ -982,12 +982,14 @@ func (c *Client) RemoveForkPage(ctx context.Context, forkID, pageID string) erro
 	return c.do(ctx, "DELETE", "/forks/"+forkID+"/pages/"+pageID, nil, nil)
 }
 
-// MergeFork merges all fork pages into live content. With publishNew, pages
-// the merge creates are also published (held pages stay drafts).
-func (c *Client) MergeFork(ctx context.Context, forkID string, publishNew bool) (*ForkMergeResult, error) {
-	var body interface{}
+// MergeFork merges all fork pages into live content, exactly as reviewed:
+// digest is the one GetForkDiff returned, and the merge is refused if the fork
+// or a page it changes was edited since. With publishNew, pages the merge
+// creates are also published (held pages stay drafts).
+func (c *Client) MergeFork(ctx context.Context, forkID string, publishNew bool, digest string) (*ForkMergeResult, error) {
+	body := map[string]interface{}{"digest": digest}
 	if publishNew {
-		body = map[string]bool{"publish_new": true}
+		body["publish_new"] = true
 	}
 	var result ForkMergeResult
 	if err := c.do(ctx, "POST", "/forks/"+forkID+"/merge", body, &result); err != nil {

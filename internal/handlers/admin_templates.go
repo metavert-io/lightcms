@@ -7919,14 +7919,17 @@ async function doSearch(q) {
                 {{if eq .Fork.Status "active"}}
                 <a href="/cm/forks/{{.Fork.ID.Hex}}/preview" class="btn btn-secondary">👁 Start Preview</a>
                 {{if .CanMerge}}
-                <form method="POST" action="/cm/forks/{{.Fork.ID.Hex}}/merge" style="display:flex;gap:0.75rem;align-items:center;margin:0" data-confirm="Merge this fork into the live site? This will update all matching pages and cannot be undone." data-confirm-title="Merge fork">
+                {{if .ReviewDigest}}
+                <form method="POST" action="/cm/forks/{{.Fork.ID.Hex}}/merge" style="display:flex;gap:0.75rem;align-items:center;margin:0" data-confirm="Merge the changes shown on this page into the live site? Each page's previous version stays in its history, so a page can be reverted afterwards. If anything changes before you confirm, nothing is merged." data-confirm-title="Merge fork">
                     {{.CSRFField}}
+                    <input type="hidden" name="digest" value="{{.ReviewDigest}}">
                     <label class="checkbox-label" style="margin:0;font-size:0.85rem;white-space:nowrap" title="New pages are created as drafts unless this is checked. Pages on hold always stay drafts.">
                         <input type="checkbox" name="publish_new">
                         Publish new pages
                     </label>
                     <button type="submit" class="btn btn-primary">Merge into Live →</button>
                 </form>
+                {{end}}
                 <form method="POST" action="/cm/forks/{{.Fork.ID.Hex}}/archive" style="margin:0" data-confirm="Archive this fork without merging?" data-confirm-title="Archive fork">
                     {{.CSRFField}}
                     <button type="submit" class="btn btn-outline">Archive</button>
@@ -7972,6 +7975,55 @@ async function doSearch(q) {
             </div>
             {{end}}
         </div>
+
+        {{if .Fork.SubmittedAt}}
+        <div class="success-message" style="margin-bottom:1.5rem">Submitted for review by {{.Fork.SubmittedByEmail}} on {{.Fork.SubmittedAt.Format "Jan 2, 2006 15:04"}}. The agent that made it can't change it any more.</div>
+        {{end}}
+        {{if .ReviewError}}<div class="error-message">{{.ReviewError}}</div>{{end}}
+        {{if .Review}}
+        <div class="page-header" style="margin-top:2rem">
+            <h2 style="font-size:1.25rem">Changes to review</h2>
+        </div>
+        <p class="help-text">Everything a merge would change on the live site, field by field. Merging applies exactly this: if the fork or one of these live pages changes before you merge, the merge is refused and you review again.</p>
+        <style>
+            .review-page { padding: 1rem 1.25rem; margin-bottom: 1rem; }
+            .review-page h3 { font-size: 1rem; margin: 0 0 0.75rem; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+            .review-table td { vertical-align: top; }
+            .review-table pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font-size: 0.8rem; max-height: 32rem; overflow: auto; }
+            .review-table .before { background: rgba(239, 68, 68, 0.06); }
+            .review-table .after { background: rgba(16, 185, 129, 0.08); }
+            .review-table summary { cursor: pointer; color: var(--text-muted); font-size: 0.8rem; }
+            .review-table summary .preview { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font-family: monospace; color: var(--text-primary, inherit); }
+        </style>
+        {{range .Review}}
+        <div class="card review-page">
+            <h3><code>{{.Path}}</code>
+                {{if eq .Status "added"}}<span class="badge badge-success">new page</span>{{else}}<span class="badge badge-info">changed</span>{{end}}
+                {{if .Conflict}}<span class="badge badge-warning">live page edited since it was forked</span>{{end}}
+            </h3>
+            {{if .Fields}}
+            <div class="table-container">
+                <table class="table review-table">
+                    <thead><tr><th style="width:12rem">Field</th>{{if ne .Status "added"}}<th>Live now</th>{{end}}<th>After merge</th></tr></thead>
+                    <tbody>
+                    {{range .Fields}}
+                    <tr>
+                        <td><code>{{.Name}}</code></td>
+                        {{if not .IsNew}}
+                        <td class="before">{{if .LiveLong}}<details><summary><span class="preview">{{.LivePreview}}</span> Show all</summary><pre>{{.Live}}</pre></details>{{else}}<pre>{{.Live}}</pre>{{end}}</td>
+                        {{end}}
+                        <td class="after">{{if .ForkLong}}<details><summary><span class="preview">{{.ForkPreview}}</span> Show all</summary><pre>{{.Fork}}</pre></details>{{else}}<pre>{{.Fork}}</pre>{{end}}</td>
+                    </tr>
+                    {{end}}
+                    </tbody>
+                </table>
+            </div>
+            {{else}}
+            <p class="help-text" style="margin:0">Nothing differs from the live page.</p>
+            {{end}}
+        </div>
+        {{end}}
+        {{end}}
 
         <div class="page-header" style="margin-top:2rem">
             <h2 style="font-size:1.25rem">Pages in this fork</h2>

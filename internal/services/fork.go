@@ -3,8 +3,10 @@ package services
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -228,21 +230,60 @@ func (s *ForkService) RemovePage(ctx context.Context, forkID primitive.ObjectID,
 // New pages are created with the fork copy's published flag. With publishNew,
 // new pages that would be drafts are then published through the normal
 // publish path. Held pages always stay drafts.
-func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, mergedByID primitive.ObjectID, mergedByEmail string, publishNew bool) (*MergeResult, error) {
+//
+// reviewedDigest is the Digest of the review the merge was approved from (see
+// Review). The merge is refused with ErrForkChanged when the fork, or a live
+// page it would change, differs from what that review showed.
+//
+// Every live page the merge creates or changes gets a version, recorded with
+// the provenance and editor in ctx, so the merge shows in page history and an
+// agent session's merge can be rolled back.
+func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, mergedByID primitive.ObjectID, mergedByEmail string, publishNew bool, reviewedDigest string) (*MergeResult, error) {
 	fork, err := s.GetByID(ctx, forkID)
 	if err != nil {
 		return nil, fmt.Errorf("fork not found: %w", err)
 	}
-	if fork.Status != "active" {
+	// "merging" is let through: claimForMerge decides whether that claim is
+	// live or left behind by a merge that never finished.
+	if fork.Status != "active" && fork.Status != "merging" {
 		return nil, fmt.Errorf("fork is %s, cannot merge", fork.Status)
 	}
+	if reviewedDigest == "" {
+		return nil, ErrReviewRequired
+	}
 
+	// Claim the fork, so a second merge (an agent retrying, two people at
+	// once) finds it busy and API writes to it are refused meanwhile. A claim
+	// left behind by a crash expires.
+	claimed, err := s.claimForMerge(ctx, forkID)
+	if err != nil {
+		return nil, fmt.Errorf("claim fork: %w", err)
+	}
+	if !claimed {
+		return nil, fmt.Errorf("fork is already being merged")
+	}
+	merged := false
+	defer func() {
+		if !merged {
+			s.releaseMergeClaim(ctx, forkID)
+		}
+	}()
+
+	// The digest is taken from exactly the pages this merge applies.
 	pages, err := s.ListPages(ctx, forkID)
 	if err != nil {
 		return nil, fmt.Errorf("list fork pages: %w", err)
 	}
+	review, err := s.reviewOf(ctx, pages)
+	if err != nil {
+		return nil, fmt.Errorf("review fork: %w", err)
+	}
+	if review.Digest != reviewedDigest {
+		return nil, ErrForkChanged
+	}
 
 	result := &MergeResult{}
+	comment := fmt.Sprintf("Merged fork %q", fork.Name)
 
 	for _, forkPage := range pages {
 		// Look for existing live page with the same full_path
@@ -263,6 +304,9 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 			newPage.BaseUpdatedAt = nil
 			newPage.CreatedAt = now
 			newPage.UpdatedAt = now
+			// A new page goes live only as the merge says (publish_new),
+			// never later on a schedule set in the fork.
+			newPage.PublishAt = nil
 			if newPage.Hold {
 				// A held page never goes live through a merge.
 				newPage.Published = false
@@ -271,6 +315,7 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 			if _, err := s.db.InsertOne(ctx, "content", &newPage); err != nil {
 				return nil, fmt.Errorf("create live page %s: %w", forkPage.FullPath, err)
 			}
+			s.recordMergeVersion(ctx, &newPage, nil, comment)
 			// Regenerate static file if published
 			if newPage.Published && s.contentService != nil {
 				_ = s.contentService.GenerateStaticPage(ctx, &newPage)
@@ -296,41 +341,39 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 			}
 
 			// Update live page fields from fork
+			merged := livePage
+			applyMergedFields(&merged, &forkPage)
+			merged.UpdatedAt = now
 			update := bson.M{"$set": bson.M{
-				"title":            forkPage.Title,
-				"slug":             forkPage.Slug,
-				"folder_id":        forkPage.FolderID,
-				"folder_path":      forkPage.FolderPath,
-				"full_path":        forkPage.FullPath,
-				"category":         forkPage.Category,
-				"tags":             forkPage.Tags,
-				"meta_description": forkPage.MetaDescription,
-				"og_image":         forkPage.OGImage,
-				"data":             forkPage.Data,
-				"use_header":       forkPage.UseHeader,
-				"use_footer":       forkPage.UseFooter,
-				"use_theme":        forkPage.UseTheme,
-				"raw_mode":         forkPage.RawMode,
-				"noindex":          forkPage.NoIndex,
-				"author_name":      forkPage.AuthorName,
-				"author_url":       forkPage.AuthorURL,
-				"template_id":      forkPage.TemplateID,
-				"template_name":    forkPage.TemplateName,
+				"title":            merged.Title,
+				"slug":             merged.Slug,
+				"folder_id":        merged.FolderID,
+				"folder_path":      merged.FolderPath,
+				"full_path":        merged.FullPath,
+				"category":         merged.Category,
+				"tags":             merged.Tags,
+				"meta_description": merged.MetaDescription,
+				"og_image":         merged.OGImage,
+				"data":             merged.Data,
+				"use_header":       merged.UseHeader,
+				"use_footer":       merged.UseFooter,
+				"use_theme":        merged.UseTheme,
+				"raw_mode":         merged.RawMode,
+				"noindex":          merged.NoIndex,
+				"author_name":      merged.AuthorName,
+				"author_url":       merged.AuthorURL,
+				"template_id":      merged.TemplateID,
+				"template_name":    merged.TemplateName,
 				"updated_at":       now,
 			}}
 			if err := s.db.UpdateOne(ctx, "content", bson.M{"_id": livePage.ID}, update); err != nil {
 				return nil, fmt.Errorf("update live page %s: %w", forkPage.FullPath, err)
 			}
-			// Regenerate static file if published
-			if livePage.Published && s.contentService != nil {
-				livePage.Title = forkPage.Title
-				livePage.Data = forkPage.Data
-				livePage.UseHeader = forkPage.UseHeader
-				livePage.UseFooter = forkPage.UseFooter
-				livePage.UseTheme = forkPage.UseTheme
-				livePage.TemplateID = forkPage.TemplateID
-				livePage.TemplateName = forkPage.TemplateName
-				_ = s.contentService.GenerateStaticPage(ctx, &livePage)
+			s.recordMergeVersion(ctx, &merged, &livePage, comment)
+			// Regenerate the static file from the whole merged page, so its
+			// meta description, tags and author render as merged too.
+			if merged.Published && s.contentService != nil {
+				_ = s.contentService.GenerateStaticPage(ctx, &merged)
 			}
 			result.Updated++
 			result.UpdatedIDs = append(result.UpdatedIDs, livePage.ID)
@@ -339,16 +382,20 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 
 	// Mark fork as merged, keeping the page counts as its history.
 	now := time.Now()
-	if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{
-		"status":          "merged",
-		"merged_at":       now,
-		"merged_by":       mergedByID,
-		"merged_by_email": mergedByEmail,
-		"merged_created":  result.Created,
-		"merged_updated":  result.Updated,
-	}}); err != nil {
+	if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{
+		"$set": bson.M{
+			"status":          "merged",
+			"merged_at":       now,
+			"merged_by":       mergedByID,
+			"merged_by_email": mergedByEmail,
+			"merged_created":  result.Created,
+			"merged_updated":  result.Updated,
+		},
+		"$unset": bson.M{"merging_at": ""},
+	}); err != nil {
 		return nil, fmt.Errorf("mark fork merged: %w", err)
 	}
+	merged = true
 	s.releaseSandboxes(ctx, forkID)
 
 	// The copies have served their purpose: left behind they would only be
@@ -359,6 +406,78 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 	}
 
 	return result, nil
+}
+
+// mergeClaimTTL is how long a merge's claim on a fork lasts if the merge never
+// finishes (a crash part way).
+const mergeClaimTTL = 10 * time.Minute
+
+// claimForMerge moves an active fork to "merging", and reports whether this
+// call did.
+func (s *ForkService) claimForMerge(ctx context.Context, forkID primitive.ObjectID) (bool, error) {
+	now := time.Now()
+	result, err := s.db.Collection("content_forks").UpdateOne(ctx,
+		bson.M{"_id": forkID, "$or": bson.A{
+			bson.M{"status": "active"},
+			bson.M{"status": "merging", "merging_at": bson.M{"$lt": now.Add(-mergeClaimTTL)}},
+		}},
+		bson.M{"$set": bson.M{"status": "merging", "merging_at": now}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
+// releaseMergeClaim returns a fork whose merge did not complete to "active".
+func (s *ForkService) releaseMergeClaim(ctx context.Context, forkID primitive.ObjectID) {
+	if err := s.db.UpdateOne(ctx, "content_forks",
+		bson.M{"_id": forkID, "status": "merging"},
+		bson.M{"$set": bson.M{"status": "active"}, "$unset": bson.M{"merging_at": ""}}); err != nil {
+		log.Printf("Warning: failed to release the merge claim on fork %s: %v", forkID.Hex(), err)
+	}
+}
+
+// ErrReviewRequired means a merge was attempted without naming the review it
+// was approved from.
+var ErrReviewRequired = errors.New("review the fork first: pass the digest from its diff")
+
+// ErrForkChanged means the fork, or a live page it would change, was edited
+// after the review the merge was approved from.
+var ErrForkChanged = errors.New("the fork or a page it changes was edited after it was reviewed; review it again before merging")
+
+// applyMergedFields copies onto live every field a merge takes from a fork page.
+func applyMergedFields(live, fork *models.Content) {
+	live.Title = fork.Title
+	live.Slug = fork.Slug
+	live.FolderID = fork.FolderID
+	live.FolderPath = fork.FolderPath
+	live.FullPath = fork.FullPath
+	live.Category = fork.Category
+	live.Tags = fork.Tags
+	live.MetaDescription = fork.MetaDescription
+	live.OGImage = fork.OGImage
+	live.Data = fork.Data
+	live.UseHeader = fork.UseHeader
+	live.UseFooter = fork.UseFooter
+	live.UseTheme = fork.UseTheme
+	live.RawMode = fork.RawMode
+	live.NoIndex = fork.NoIndex
+	live.AuthorName = fork.AuthorName
+	live.AuthorURL = fork.AuthorURL
+	live.TemplateID = fork.TemplateID
+	live.TemplateName = fork.TemplateName
+}
+
+// recordMergeVersion writes the version for a live page a merge created
+// (original nil) or changed. A page with no history yet gets its pre-merge
+// state as version 1 first, so the merge can be undone.
+func (s *ForkService) recordMergeVersion(ctx context.Context, page, original *models.Content, comment string) {
+	if s.contentService == nil {
+		return
+	}
+	if err := s.contentService.saveVersion(ctx, page, original, comment); err != nil {
+		log.Printf("Warning: failed to record the merge in %s's history: %v", page.FullPath, err)
+	}
 }
 
 // publishMerged publishes a page that a merge just created, through the
@@ -389,6 +508,15 @@ func (s *ForkService) Archive(ctx context.Context, forkID primitive.ObjectID) er
 	}
 	s.releaseSandboxes(ctx, forkID)
 	return nil
+}
+
+// Submit hands a fork off for review: from now on no API key or connection
+// can change it.
+func (s *ForkService) Submit(ctx context.Context, forkID primitive.ObjectID, byEmail string) error {
+	return s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID, "status": "active"}, bson.M{"$set": bson.M{
+		"submitted_at":       time.Now(),
+		"submitted_by_email": byEmail,
+	}})
 }
 
 // releaseSandboxes ends any API key's or connection's sandbox that writes to
@@ -471,7 +599,8 @@ func (s *ForkService) GetPageCount(ctx context.Context, forkID primitive.ObjectI
 	return s.db.Count(ctx, "content", bson.M{"fork_id": forkID, "deleted": bson.M{"$ne": true}})
 }
 
-// FieldDiff describes one changed field between a live page and its fork copy.
+// FieldDiff describes one changed field between a live page and its fork
+// copy. Live and Fork are complete values; shorten them for display only.
 type FieldDiff struct {
 	Name string `json:"name"`
 	Live string `json:"live"`
@@ -487,31 +616,103 @@ type ForkPageDiff struct {
 	Fields   []FieldDiff `json:"fields,omitempty"`
 }
 
-// diffValue renders a field value as a comparison-friendly string, truncated
-// so diffs of large rich-text fields stay reviewable.
+// ForkReview is what a person or agent reviews before merging: every change
+// the merge would make, and a digest of the fork pages and live pages behind
+// it. Merge takes the digest and refuses if anything has changed since.
+type ForkReview struct {
+	Pages  []ForkPageDiff `json:"pages"`
+	Digest string         `json:"digest"`
+}
+
+// diffValue renders a field value for comparison and display, in full.
 func diffValue(v interface{}) string {
+	if v == nil {
+		return ""
+	}
 	s, ok := v.(string)
 	if !ok {
 		b, _ := json.Marshal(v)
 		s = string(b)
 	}
-	const max = 2000
-	if len(s) > max {
-		return s[:max] + "…"
-	}
 	return s
+}
+
+// mergedFieldValues returns, in a fixed order, every field other than the
+// template data that Merge copies from a fork page, rendered for comparison.
+func mergedFieldValues(c *models.Content) [][2]string {
+	folderID := ""
+	if c.FolderID != nil {
+		folderID = c.FolderID.Hex()
+	}
+	return [][2]string{
+		{"title", c.Title},
+		{"slug", c.Slug},
+		{"folder_path", c.FolderPath},
+		{"folder_id", folderID},
+		{"full_path", c.FullPath},
+		{"template", c.TemplateName},
+		{"template_id", c.TemplateID.Hex()},
+		{"category", c.Category},
+		{"tags", diffValue(c.Tags)},
+		{"meta_description", c.MetaDescription},
+		{"og_image", c.OGImage},
+		{"noindex", fmt.Sprint(c.NoIndex)},
+		{"author_name", c.AuthorName},
+		{"author_url", c.AuthorURL},
+		{"use_header", fmt.Sprint(c.UseHeader)},
+		{"use_footer", fmt.Sprint(c.UseFooter)},
+		{"use_theme", fmt.Sprint(c.UseTheme)},
+		{"raw_mode", fmt.Sprint(c.RawMode)},
+	}
+}
+
+// pageFingerprint is the part of a page that decides what a merge does.
+func pageFingerprint(c *models.Content) map[string]interface{} {
+	fields := map[string]interface{}{
+		"id": c.ID.Hex(), "data": c.Data, "hold": c.Hold,
+		"published": c.Published, "publish_at": c.PublishAt,
+	}
+	for _, f := range mergedFieldValues(c) {
+		fields[f[0]] = f[1]
+	}
+	return fields
 }
 
 // Diff compares every page in a fork against its live counterpart and
 // returns per-field changes. Pages with no live counterpart are "added".
 func (s *ForkService) Diff(ctx context.Context, forkID primitive.ObjectID) ([]ForkPageDiff, error) {
+	review, err := s.Review(ctx, forkID)
+	if err != nil {
+		return nil, err
+	}
+	return review.Pages, nil
+}
+
+// Review compares every page in a fork with the live page a merge would
+// change, over every field a merge writes, and returns the changes with the
+// digest a merge must present. A new page lists every field it sets.
+func (s *ForkService) Review(ctx context.Context, forkID primitive.ObjectID) (*ForkReview, error) {
 	pages, err := s.ListPages(ctx, forkID)
 	if err != nil {
 		return nil, err
 	}
+	return s.reviewOf(ctx, pages)
+}
 
-	diffs := make([]ForkPageDiff, 0, len(pages))
-	for _, fp := range pages {
+// reviewOf reviews the given fork pages against the live site.
+func (s *ForkService) reviewOf(ctx context.Context, pages []models.Content) (*ForkReview, error) {
+	pages = append([]models.Content(nil), pages...)
+	sort.Slice(pages, func(i, j int) bool {
+		if pages[i].FullPath != pages[j].FullPath {
+			return pages[i].FullPath < pages[j].FullPath
+		}
+		return pages[i].ID.Hex() < pages[j].ID.Hex()
+	})
+
+	review := &ForkReview{Pages: make([]ForkPageDiff, 0, len(pages))}
+	fingerprints := make([]interface{}, 0, len(pages))
+	for i := range pages {
+		fp := &pages[i]
 		d := ForkPageDiff{Path: fp.FullPath, Title: fp.Title}
 
 		var live models.Content
@@ -520,36 +721,36 @@ func (s *ForkService) Diff(ctx context.Context, forkID primitive.ObjectID) ([]Fo
 			"deleted":   bson.M{"$ne": true},
 			"fork_id":   nil,
 		}, &live)
+		var liveFields [][2]string
+		var liveData map[string]interface{}
 		if err != nil {
 			d.Status = "added"
-			diffs = append(diffs, d)
-			continue
+			fingerprints = append(fingerprints, map[string]interface{}{"fork": pageFingerprint(fp)})
+		} else {
+			d.Status = "modified"
+			if fp.BaseUpdatedAt != nil && live.UpdatedAt.After(*fp.BaseUpdatedAt) {
+				d.Conflict = true
+			}
+			liveFields, liveData = mergedFieldValues(&live), live.Data
+			fingerprints = append(fingerprints, map[string]interface{}{"fork": pageFingerprint(fp), "live": pageFingerprint(&live)})
 		}
 
-		d.Status = "modified"
-		if fp.BaseUpdatedAt != nil && live.UpdatedAt.After(*fp.BaseUpdatedAt) {
-			d.Conflict = true
-		}
-
-		if live.Title != fp.Title {
-			d.Fields = append(d.Fields, FieldDiff{Name: "title", Live: live.Title, Fork: fp.Title})
-		}
-		if live.MetaDescription != fp.MetaDescription {
-			d.Fields = append(d.Fields, FieldDiff{Name: "meta_description", Live: live.MetaDescription, Fork: fp.MetaDescription})
-		}
-		if live.OGImage != fp.OGImage {
-			d.Fields = append(d.Fields, FieldDiff{Name: "og_image", Live: live.OGImage, Fork: fp.OGImage})
-		}
-		if live.NoIndex != fp.NoIndex {
-			d.Fields = append(d.Fields, FieldDiff{Name: "noindex", Live: fmt.Sprint(live.NoIndex), Fork: fmt.Sprint(fp.NoIndex)})
-		}
-		if live.AuthorName != fp.AuthorName {
-			d.Fields = append(d.Fields, FieldDiff{Name: "author_name", Live: live.AuthorName, Fork: fp.AuthorName})
+		for j, f := range mergedFieldValues(fp) {
+			if liveFields == nil {
+				// A new page: list what it sets, leaving out empty values.
+				if f[1] != "" && f[1] != "false" && f[1] != "null" {
+					d.Fields = append(d.Fields, FieldDiff{Name: f[0], Fork: f[1]})
+				}
+				continue
+			}
+			if f[1] != liveFields[j][1] {
+				d.Fields = append(d.Fields, FieldDiff{Name: f[0], Live: liveFields[j][1], Fork: f[1]})
+			}
 		}
 
 		// Union of data field names from both sides, in sorted order.
 		names := map[string]bool{}
-		for k := range live.Data {
+		for k := range liveData {
 			names[k] = true
 		}
 		for k := range fp.Data {
@@ -561,13 +762,20 @@ func (s *ForkService) Diff(ctx context.Context, forkID primitive.ObjectID) ([]Fo
 		}
 		sort.Strings(sorted)
 		for _, k := range sorted {
-			lv, fv := diffValue(live.Data[k]), diffValue(fp.Data[k])
+			lv, fv := diffValue(liveData[k]), diffValue(fp.Data[k])
 			if lv != fv {
 				d.Fields = append(d.Fields, FieldDiff{Name: k, Live: lv, Fork: fv})
 			}
 		}
 
-		diffs = append(diffs, d)
+		review.Pages = append(review.Pages, d)
 	}
-	return diffs, nil
+
+	encoded, err := json.Marshal(fingerprints)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint fork: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	review.Digest = hex.EncodeToString(sum[:])
+	return review, nil
 }

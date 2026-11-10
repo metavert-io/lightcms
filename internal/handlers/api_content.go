@@ -627,6 +627,16 @@ func (a *APIHandler) APIDeleteContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deleting a page copy changes its fork: the fork's rules apply.
+	content, err := a.contentService.GetContent(r.Context(), id)
+	if err != nil {
+		a.jsonError(w, http.StatusNotFound, "content not found")
+		return
+	}
+	if !a.callerMayWriteContent(w, r, content) {
+		return
+	}
+
 	if err := a.contentService.DeleteContent(r.Context(), id); err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -654,6 +664,9 @@ func (a *APIHandler) APIRestoreContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if deleted.PublishedBeforeDelete && deleted.ForkID == nil && !deleted.Hold && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return
+	}
+	if !a.callerMayWriteContent(w, r, deleted) {
 		return
 	}
 
@@ -790,6 +803,9 @@ func (a *APIHandler) APIRevertContentVersion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if target.Published != current.Published && current.ForkID == nil && !a.requirePermission(w, r, auth.PermContentPublish) {
+		return
+	}
+	if !a.callerMayWriteContent(w, r, current) {
 		return
 	}
 

@@ -55,6 +55,7 @@ type ForkPageDiff struct {
 type ForkDiff struct {
 	ForkID string         `json:"fork_id"`
 	Pages  []ForkPageDiff `json:"pages"`
+	Digest string         `json:"digest,omitempty"` // merge_fork needs it: it pins the merge to this review
 	Status string         `json:"status,omitempty"`
 	// Set on merged forks: their copies are gone, so Pages is empty.
 	MergedCreated int `json:"merged_created,omitempty"`

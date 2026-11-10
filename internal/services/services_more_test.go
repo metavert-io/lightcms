@@ -66,7 +66,7 @@ func TestForkService_Merge(t *testing.T) {
 	if _, err := fs.ForkPage(ctx, fork.ID, liveID); err != nil {
 		t.Fatalf("ForkPage: %v", err)
 	}
-	if _, err := fs.Merge(ctx, fork.ID, uid, "e@x.com", false); err != nil {
+	if _, err := fs.Merge(ctx, fork.ID, uid, "e@x.com", false, reviewDigest(t, fs, fork.ID)); err != nil {
 		t.Errorf("Merge: %v", err)
 	}
 }

@@ -56,7 +56,7 @@ func TestForkService_Merge_CreateUpdateConflict(t *testing.T) {
 		t.Fatalf("insert fork-only page: %v", err)
 	}
 
-	result, err := fs.Merge(ctx, fork.ID, uid, "merger@x.com", false)
+	result, err := fs.Merge(ctx, fork.ID, uid, "merger@x.com", false, reviewDigest(t, fs, fork.ID))
 	if err != nil {
 		t.Fatalf("Merge: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestForkService_Merge_CreateUpdateConflict(t *testing.T) {
 	}
 
 	// Merging a non-active fork fails.
-	if _, err := fs.Merge(ctx, fork.ID, uid, "merger@x.com", false); err == nil {
+	if _, err := fs.Merge(ctx, fork.ID, uid, "merger@x.com", false, reviewDigest(t, fs, fork.ID)); err == nil {
 		t.Error("expected error merging an already-merged fork")
 	}
 
@@ -171,7 +171,7 @@ func TestForkService_Merge_PublishNew(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	insertForkOnly(t, fs, fork.ID, "/pn-off-new", false)
-	res, err := fs.Merge(ctx, fork.ID, uid, "m@x.com", false)
+	res, err := fs.Merge(ctx, fork.ID, uid, "m@x.com", false, reviewDigest(t, fs, fork.ID))
 	if err != nil {
 		t.Fatalf("Merge: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestForkService_Merge_PublishNew(t *testing.T) {
 	}
 	insertForkOnly(t, fs, fork2.ID, "/pn-on-new", false)
 	insertForkOnly(t, fs, fork2.ID, "/pn-on-held", true)
-	res, err = fs.Merge(ctx, fork2.ID, uid, "m@x.com", true)
+	res, err = fs.Merge(ctx, fork2.ID, uid, "m@x.com", true, reviewDigest(t, fs, fork2.ID))
 	if err != nil {
 		t.Fatalf("Merge 2: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestForkService_Merge_PublishNew(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if _, err := fs.Merge(ctx, fork3.ID, uid, "m@x.com", false); err != nil {
+	if _, err := fs.Merge(ctx, fork3.ID, uid, "m@x.com", false, reviewDigest(t, fs, fork3.ID)); err != nil {
 		t.Fatalf("Merge 3: %v", err)
 	}
 	if got := livePageAt(t, fs, "/pn-held-pub"); got.Published {
@@ -554,7 +554,7 @@ func TestForkService_Merge_Errors(t *testing.T) {
 	uid := primitive.NewObjectID()
 
 	// Unknown fork.
-	if _, err := fs.Merge(ctx, primitive.NewObjectID(), uid, "x@x.com", false); err == nil {
+	if _, err := fs.Merge(ctx, primitive.NewObjectID(), uid, "x@x.com", false, reviewDigest(t, fs, primitive.NewObjectID())); err == nil {
 		t.Error("expected error for unknown fork")
 	}
 
@@ -572,7 +572,7 @@ func TestForkService_Merge_Errors(t *testing.T) {
 		t.Fatalf("insert fork-only page: %v", err)
 	}
 	db.SetFaultHook(testutil.FailOp("InsertOne"))
-	_, mergeErr := fs.Merge(ctx, fork.ID, uid, "x@x.com", false)
+	_, mergeErr := fs.Merge(ctx, fork.ID, uid, "x@x.com", false, reviewDigest(t, fs, fork.ID))
 	db.SetFaultHook(nil)
 	if mergeErr == nil {
 		t.Error("expected merge error when live-page insert fails")
@@ -588,7 +588,7 @@ func TestForkService_Merge_Errors(t *testing.T) {
 		t.Fatalf("ForkPage: %v", err)
 	}
 	db.SetFaultHook(testutil.FailOp("UpdateOne"))
-	_, mergeErr = fs.Merge(ctx, fork2.ID, uid, "x@x.com", false)
+	_, mergeErr = fs.Merge(ctx, fork2.ID, uid, "x@x.com", false, reviewDigest(t, fs, fork2.ID))
 	db.SetFaultHook(nil)
 	if mergeErr == nil {
 		t.Error("expected merge error when live-page update fails")
@@ -644,4 +644,15 @@ func TestApproval_HeldContentStaysDraft(t *testing.T) {
 			t.Errorf("%s: still pending approval after it was approved", tc.path)
 		}
 	}
+}
+
+// reviewDigest reviews a fork, as a person or agent does before merging, and
+// returns the digest a merge presents.
+func reviewDigest(t *testing.T, fs *ForkService, forkID primitive.ObjectID) string {
+	t.Helper()
+	review, err := fs.Review(context.Background(), forkID)
+	if err != nil {
+		return ""
+	}
+	return review.Digest
 }

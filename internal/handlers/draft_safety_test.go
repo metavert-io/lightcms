@@ -62,6 +62,17 @@ func apiCall(t *testing.T, h http.HandlerFunc, method, target, body string, vars
 	return rr, out
 }
 
+// forkDigest reviews a fork, as a person or agent does before merging, and
+// returns the digest the merge presents.
+func forkDigest(t *testing.T, a *APIHandler, forkID primitive.ObjectID) string {
+	t.Helper()
+	review, err := a.forkService.Review(context.Background(), forkID)
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	return review.Digest
+}
+
 // idSet collects the "id" of each element of a JSON array of objects, or the
 // elements themselves when they are strings.
 func idSet(v interface{}) map[string]map[string]interface{} {
@@ -319,7 +330,12 @@ func TestAPIMergeFork_PublishNewAndCleanup(t *testing.T) {
 	seedPage(t, db, models.Content{Title: "New", FullPath: "/mg-new", ForkID: &forkID})
 	vars := map[string]string{"id": forkID.Hex()}
 
-	rr, out := apiCall(t, a.APIMergeFork, "POST", "/x", "", vars) // no body: default behaviour
+	// Without the digest of a review, nothing is merged.
+	if rr, _ := apiCall(t, a.APIMergeFork, "POST", "/x", "", vars); rr.Code != 400 {
+		t.Fatalf("merge without a digest: %d %s", rr.Code, rr.Body.String())
+	}
+
+	rr, out := apiCall(t, a.APIMergeFork, "POST", "/x", `{"digest":"`+forkDigest(t, a, forkID)+`"}`, vars) // default behaviour
 	if rr.Code != 200 {
 		t.Fatalf("merge: %d %s", rr.Code, rr.Body.String())
 	}
@@ -370,7 +386,7 @@ func TestAPIMergeFork_PublishNewAndCleanup(t *testing.T) {
 	fork2 := createTestFork(t, db, "mg-publish")
 	seedPage(t, db, models.Content{Title: "New Pub", FullPath: "/mg-new-pub", ForkID: &fork2})
 	seedPage(t, db, models.Content{Title: "New Held", FullPath: "/mg-new-held", ForkID: &fork2, Hold: true})
-	rr, out = apiCall(t, a.APIMergeFork, "POST", "/x", `{"publish_new":true}`, map[string]string{"id": fork2.Hex()})
+	rr, out = apiCall(t, a.APIMergeFork, "POST", "/x", `{"publish_new":true,"digest":"`+forkDigest(t, a, fork2)+`"}`, map[string]string{"id": fork2.Hex()})
 	if rr.Code != 200 || out["publish_new"] != true {
 		t.Fatalf("merge publish_new: %d %s", rr.Code, rr.Body.String())
 	}
@@ -497,7 +513,11 @@ func TestAdminForkMerge_PublishNewAndMergedView(t *testing.T) {
 		t.Errorf("ViewFork (active): %d, publish_new checkbox present = %v", rr.Code, strings.Contains(rr.Body.String(), `name="publish_new"`))
 	}
 
-	rr := postForm(t, h.MergeFork, url.Values{"publish_new": {"on"}}, vars)
+	review, err := h.forkService.Review(context.Background(), forkID)
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	rr := postForm(t, h.MergeFork, url.Values{"publish_new": {"on"}, "digest": {review.Digest}}, vars)
 	if rr.Code != 200 {
 		t.Fatalf("MergeFork: %d %s", rr.Code, rr.Body.String())
 	}

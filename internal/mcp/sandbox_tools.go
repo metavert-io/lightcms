@@ -161,9 +161,11 @@ A key or connection set to Sandbox access is always limited to forks it created;
 
 	// End sandbox
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "end_agent_sandbox",
-		Title:       "End Agent Sandbox",
-		Description: `End the sandbox. action='submit' leaves the fork for review and merge (at /cm/forks/{id}); action='discard' permanently deletes the fork and all its changes. A key or connection set to Sandbox access stays limited to forks it created afterwards. Merging is a separate step (merge_fork) that a sandboxed connection can't take.`,
+		Name:  "end_agent_sandbox",
+		Title: "End Agent Sandbox",
+		Description: `End the sandbox. action='submit' hands the fork off for review: it is frozen, so no API key or connection (this one included) can change it, and a person reviews and merges it at /cm/forks/{id}. action='discard' permanently deletes the fork and all its changes. A key or connection set to Sandbox access stays limited to forks it created afterwards.
+
+To merge its own work instead of handing it off, a key or connection needs the merge permission, which an admin grants under API Keys or Connected Apps: then review with get_fork_diff and merge with merge_fork, without submitting.`,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "End Agent Sandbox",
 			ReadOnlyHint:    false,
@@ -209,7 +211,7 @@ A key or connection set to Sandbox access is always limited to forks it created;
 			"changes":    diff.Pages,
 			"review_url": "/cm/forks/" + forkID,
 			"restricted": result["restricted"],
-			"message":    "Sandbox submitted. A person can review the changes and merge the fork from the admin UI.",
+			"message":    "Sandbox submitted. The fork is frozen for review; a person can merge it from the admin UI.",
 		}), nil, nil
 	})
 
@@ -217,7 +219,7 @@ A key or connection set to Sandbox access is always limited to forks it created;
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "get_fork_diff",
 		Title:       "Get Fork Diff",
-		Description: "Per-field differences between each page in a fork and its live counterpart — the review surface for merging a fork. Status 'added' means the page exists only in the fork.",
+		Description: "Per-field differences between each page in a fork and its live counterpart: the review surface for merging a fork. It covers every field a merge writes, with complete values; status 'added' means the page exists only in the fork and lists what it sets. Returns a digest that merge_fork needs: the merge is refused if anything changes after this diff.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:        "Get Fork Diff",
 			ReadOnlyHint: true,

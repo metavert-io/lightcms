@@ -38,8 +38,8 @@ LightCMS is a Go-powered content management system built for the AI era. It's si
 
 | Feature | Summary |
 |---------|---------|
-| **Agent Sandbox ("PRs for content")** | Agents work in an isolated fork with copy-on-write; humans review a per-field diff and merge. Live content is untouchable until merge. |
-| **Agent Governance** | Scoped API keys, sandbox-only keys (server-enforced), per-session change ledger with one-call rollback, and per-version provenance (human vs agent, which session). |
+| **Agent Sandbox ("PRs for content")** | Agents work in an isolated fork with copy-on-write; a person reviews a complete per-field diff and merges exactly what was reviewed. The server enforces it: a Sandbox key or connection can't change the live site at all. |
+| **Agent Governance** | Every key and OAuth connection acts as a person and is Sandbox or Full; merging its own forks is a separate permission only an admin grants. Per-session change ledger with one-call rollback (merges included), and per-version provenance (human vs agent, which session, which key or connection). |
 | **Admin Copilot** | `/cm/copilot` — edit, create, and publish content in plain language, with RBAC and full audit logging. |
 | **llms.txt + JSON-LD** | Auto-generated `/llms.txt` and `/llms-full.txt` for AI crawlers, schema.org structured data on every page. |
 | **MCP for Readers** | Public read-only MCP endpoint at `/mcp-public` — visitors' agents can search and read the site natively. |
@@ -93,7 +93,7 @@ LightCMS is a Go-powered content management system built for the AI era. It's si
 
 **AI-Native**: Built from the ground up for the AI era:
 - **MCP Integration**: Full Model Context Protocol server with 130 tools and 3 prompt resources for website management. Supports both local stdio and HTTP streamable transports — connect from Claude Code, Claude Desktop, or any MCP-compatible client.
-- **OAuth 2.1 for Remote Agents**: Sandboxed desktop apps like Claude's Cowork can securely connect over HTTP using OAuth 2.1 with PKCE. No embedded passwords — just authorize once and the agent manages your site.
+- **OAuth 2.1 for Remote Agents**: Sandboxed desktop apps like Claude's Cowork can securely connect over HTTP using OAuth 2.1 with PKCE. No embedded passwords: sign in once, choose what the agent may do, and it acts as you within that.
 - **Fork-Friendly**: Designed to be forked and customized by Claude Code. Ask Claude to add new content types, modify templates, or build custom features — the codebase is structured for AI-assisted development.
 - **Natural Language Website Management**: Skip the admin UI entirely. Create pages, manage assets, customize themes, and publish content through conversation.
 
@@ -176,7 +176,7 @@ Recommended agent pattern for large updates: `list_content` → transform in par
 - **Rate Limiting**: Per-IP and global rate limiting for DDoS protection
 
 ### Developer & Integration
-- **REST API**: Full `/api/v1/` JSON API with API key and OAuth token authentication, RBAC-enforced
+- **REST API**: Full `/api/v1/` JSON API with API key authentication, RBAC-enforced
 - **MCP Server**: 130 tools + 3 prompt resources for agentic website management (stdio + HTTP streamable)
 - **OAuth 2.1**: Authorization code flow with PKCE for remote MCP clients — no embedded passwords
 - **CLI Tool**: Command-line interface for all content management operations
@@ -843,17 +843,21 @@ LightCMS implements OAuth 2.1 so that remote MCP clients (like Claude's Cowork) 
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /oauth/register` | Dynamic client registration (RFC 7591) |
-| `GET /oauth/authorize` | Authorization page (admin login + consent) |
+| `GET /oauth/authorize` | Authorization page (sign-in + consent) |
 | `POST /oauth/token` | Token exchange and refresh |
 | `POST /oauth/revoke` | Token revocation (RFC 7009) |
 | `GET /oauth/jwks` | JWKS endpoint (opaque tokens, returns empty) |
 
 ### Security
 
+- **A connection acts as the person who approved it** (v7.5): every request loads that person's current role, so a role change, a disabled account or a disconnected app takes effect at once. The person also chooses the connection's access on the consent page: **Sandbox** (the default; it can change only forks it creates) or **Full** (anything their role can do). An admin can also let it merge its own forks.
+- **Tokens are for this server's MCP endpoint only** (RFC 8707): `/mcp` accepts them, `/api/v1` does not, and an MCP session stays bound to the connection that opened it.
 - **PKCE (S256)** required for all authorization requests
-- **Token rotation**: refresh tokens are single-use; a new pair is issued each time
+- **Single use**: authorization codes and refresh tokens are consumed atomically; a refresh token that comes back after it was used ends the connection
 - **Short-lived access tokens**: 1-hour TTL
-- **Refresh tokens**: 30-day TTL, revocable
+- **Refresh tokens**: 30-day TTL
+- **Revocation**: `POST /oauth/revoke` (client credentials required) ends a token, or with a refresh token the whole connection; people disconnect apps at **Connected Apps** (`/cm/connected-apps`)
+- **Registration**: rate limited per address; redirect URIs must be `https`, or `http` to this device (loopback)
 - **Rate limiting**: failed login attempts trigger progressive lockouts (1 min → 5 min → 15 min)
 - **All tokens stored as SHA-256 hashes** in the database
 
@@ -861,28 +865,26 @@ LightCMS implements OAuth 2.1 so that remote MCP clients (like Claude's Cowork) 
 
 1. Client fetches `/.well-known/oauth-authorization-server` to discover endpoints
 2. Client calls `POST /oauth/register` with its name and redirect URI
-3. Client redirects admin to `/oauth/authorize` with PKCE challenge
-4. Admin enters password and approves access
+3. Client sends you to `/oauth/authorize` with a PKCE challenge
+4. You sign in, see who the app will act as and where it sends you back, choose its access, and approve
 5. Client exchanges the authorization code for access + refresh tokens
-6. Client uses the access token as a Bearer token on `/mcp` or `/api/v1/` endpoints
+6. Client uses the access token as a Bearer token on `/mcp`
 
 This is all handled automatically by MCP-compatible clients — you just provide your LightCMS URL and approve the connection.
 
 ## REST API
 
-LightCMS provides a full REST API at `/api/v1/` authenticated with API keys or OAuth tokens. All endpoints enforce RBAC — the permissions of the authenticated user (or key owner) determine what's allowed.
+LightCMS provides a full REST API at `/api/v1/` authenticated with API keys. All endpoints enforce RBAC — the permissions of the key's owner, limited by the key's access, determine what's allowed. (OAuth access tokens are issued for the MCP endpoint and are not accepted here.)
 
 ### Authentication
 
-Include an API key or OAuth access token in the `Authorization` header:
+Include an API key in the `Authorization` header:
 
 ```bash
-# With API key
 curl -H "Authorization: Bearer lc_your_key_here" http://localhost:8082/api/v1/content
-
-# With OAuth token
-curl -H "Authorization: Bearer <oauth_access_token>" http://localhost:8082/api/v1/content
 ```
+
+A key set to **Sandbox** access (the default for keys created in the admin UI) can read the site and change only forks it creates: every other write is refused with `403`. `GET/POST /api/v1/sandbox` and `POST /api/v1/sandbox/end` open and close a sandbox fork for the key.
 
 ### Endpoints
 
@@ -986,8 +988,10 @@ Best for sandboxed desktop apps that can't run local binaries. The HTTP MCP endp
 
 1. The client discovers your LightCMS instance via well-known endpoints
 2. It registers as an OAuth client (one-time, automatic)
-3. You authorize the client by entering your admin password in the browser
+3. You sign in in the browser and choose its access: **Sandbox** (default) or **Full**
 4. The client receives short-lived access tokens and refreshes them automatically
+
+The connection acts as you, with your role, limited by the access you chose. See and change it, or disconnect it, at `/cm/connected-apps`.
 
 **To connect from a remote MCP client**, just provide your LightCMS URL (e.g., `https://yoursite.example.com`). The client handles the rest using standard OAuth 2.1 discovery.
 
@@ -1006,7 +1010,17 @@ The MCP HTTP endpoint accepts both authentication methods:
 - **API keys** (`lc_` prefix) — long-lived, created in admin panel
 - **OAuth 2.1 tokens** — short-lived, obtained through the authorization flow
 
-Both methods enforce RBAC based on the authenticated user's role.
+Both act as a person (the key's owner, or whoever approved the connection) and enforce that person's role, limited by the key's or connection's access. Each MCP session is bound to the credential that opened it, and its tools call the REST API in-process as that caller.
+
+### Agent access: Sandbox, Full, and merging (v7.5)
+
+| Setting | What it allows |
+|---------|----------------|
+| **Sandbox** | Read the site; create forks and change only the forks this key or connection created; upload new images, PDFs, fonts and text files (nothing executable, nothing replaced). Everything else is refused by the server, whichever tool sends it. |
+| **Full** | Anything the owner's role allows. `start_agent_sandbox` still works as an opt-in safety net: while it is open the server holds the key or connection to its fork. |
+| **Can merge its own forks** | Off by default; only an admin can turn it on, for an account that can merge. Lets `merge_fork` merge forks this key or connection created, after reviewing them with `get_fork_diff`. Without it, a person merges at `/cm/forks/{id}`. |
+
+Every merge names the review it was approved from: `get_fork_diff` returns a `digest`, and `merge_fork` refuses if the fork or a live page it changes was edited since. Merges write a version for each page they change, so `rollback_agent_session` undoes them.
 
 ### Available Tools (130 total) + 3 Prompt Resources
 

@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "lightcms",
   "display_name": "LightCMS",
-  "version": "7.4.6",
+  "version": "7.5.0",
   "description": "AI-native content management system with 130 MCP tools for creating, managing, and publishing website content through natural language.",
   "long_description": "LightCMS is a lightweight, AI-native, open-source CMS built with Go and MongoDB. The MCP server provides complete website management: create, edit and publish pages; templates, snippets, assets and themes; redirects, folders and collections; multi-pair search and replace; version history with rollback; agent sandbox sessions (fork-based, human-reviewed merges) and session rollback; content approvals and comments; imports, scheduling and webhooks; maintenance reports; IndexNow and SEO & AI settings (AI crawler policy, feeds, Markdown copies); and AI traffic analytics. Connects via REST API with API key authentication — no direct database access needed.",
   "author": {

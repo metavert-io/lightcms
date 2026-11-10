@@ -57,7 +57,9 @@ claude mcp add --transport http lightcms https://yoursite.example.com/mcp \
   --header "Authorization: Bearer lc_your_key_here"
 ```
 
-For remote clients (Cowork, etc.) that can't carry embedded credentials, OAuth 2.1 discovery is available at `/.well-known/oauth-authorization-server`. The client handles authorization automatically — just provide your LightCMS URL.
+For remote clients (Cowork, etc.) that can't carry embedded credentials, OAuth 2.1 discovery is available at `/.well-known/oauth-authorization-server`. The client handles authorization automatically — just provide your LightCMS URL. You sign in, and choose the connection's access: **Sandbox** (default: it can change only forks it creates) or **Full** (anything your role can do).
+
+On the hosted endpoint, `upload_asset` takes `data_base64`; `file_path` reads a local file only when the MCP server runs on your own machine (the stdio binary).
 
 ---
 
@@ -453,7 +455,9 @@ In this example, `author` and `excerpt` are stored as content fields because the
 
 ## 10. Security Notes
 
-- All MCP tools require a valid API key (`Authorization: Bearer lc_...`) or a valid OAuth 2.1 access token.
+- All MCP tools require a valid API key (`Authorization: Bearer lc_...`) or a valid OAuth 2.1 access token. Either acts as a person (the key's owner, or whoever approved the connection), with that person's current role.
+- A key or connection set to **Sandbox** access can change only forks it created; the server refuses everything else, whichever tool asks. `start_agent_sandbox` records the open sandbox on the key or connection, so it holds across sessions and restarts.
+- `merge_fork` needs the `digest` from `get_fork_diff`, and refuses if anything changed since. Through a key or connection it merges only forks that key or connection created, and only when an admin has allowed it to merge its own forks.
 - Import tools (`import_markdown`, `import_csv`, `create_import_source`, `trigger_import_source`) require at minimum **editor** role. `delete_import_source` requires editor or admin.
 - `cancel_import_job` requires editor or admin role.
 - RSS feed URLs are fetched server-side by the LightCMS backend. Ensure your LightCMS server has outbound HTTP access to the feed host if you are running behind a firewall or NAT.
