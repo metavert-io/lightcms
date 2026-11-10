@@ -243,23 +243,43 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 	if err != nil {
 		return nil, fmt.Errorf("fork not found: %w", err)
 	}
-	if fork.Status != "active" {
+	// "merging" is let through: claimForMerge decides whether that claim is
+	// live or left behind by a merge that never finished.
+	if fork.Status != "active" && fork.Status != "merging" {
 		return nil, fmt.Errorf("fork is %s, cannot merge", fork.Status)
 	}
 	if reviewedDigest == "" {
 		return nil, ErrReviewRequired
 	}
-	review, err := s.Review(ctx, forkID)
+
+	// Claim the fork, so a second merge (an agent retrying, two people at
+	// once) finds it busy and API writes to it are refused meanwhile. A claim
+	// left behind by a crash expires.
+	claimed, err := s.claimForMerge(ctx, forkID)
+	if err != nil {
+		return nil, fmt.Errorf("claim fork: %w", err)
+	}
+	if !claimed {
+		return nil, fmt.Errorf("fork is already being merged")
+	}
+	merged := false
+	defer func() {
+		if !merged {
+			s.releaseMergeClaim(ctx, forkID)
+		}
+	}()
+
+	// The digest is taken from exactly the pages this merge applies.
+	pages, err := s.ListPages(ctx, forkID)
+	if err != nil {
+		return nil, fmt.Errorf("list fork pages: %w", err)
+	}
+	review, err := s.reviewOf(ctx, pages)
 	if err != nil {
 		return nil, fmt.Errorf("review fork: %w", err)
 	}
 	if review.Digest != reviewedDigest {
 		return nil, ErrForkChanged
-	}
-
-	pages, err := s.ListPages(ctx, forkID)
-	if err != nil {
-		return nil, fmt.Errorf("list fork pages: %w", err)
 	}
 
 	result := &MergeResult{}
@@ -284,6 +304,9 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 			newPage.BaseUpdatedAt = nil
 			newPage.CreatedAt = now
 			newPage.UpdatedAt = now
+			// A new page goes live only as the merge says (publish_new),
+			// never later on a schedule set in the fork.
+			newPage.PublishAt = nil
 			if newPage.Hold {
 				// A held page never goes live through a merge.
 				newPage.Published = false
@@ -359,16 +382,20 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 
 	// Mark fork as merged, keeping the page counts as its history.
 	now := time.Now()
-	if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{
-		"status":          "merged",
-		"merged_at":       now,
-		"merged_by":       mergedByID,
-		"merged_by_email": mergedByEmail,
-		"merged_created":  result.Created,
-		"merged_updated":  result.Updated,
-	}}); err != nil {
+	if err := s.db.UpdateOne(ctx, "content_forks", bson.M{"_id": forkID}, bson.M{
+		"$set": bson.M{
+			"status":          "merged",
+			"merged_at":       now,
+			"merged_by":       mergedByID,
+			"merged_by_email": mergedByEmail,
+			"merged_created":  result.Created,
+			"merged_updated":  result.Updated,
+		},
+		"$unset": bson.M{"merging_at": ""},
+	}); err != nil {
 		return nil, fmt.Errorf("mark fork merged: %w", err)
 	}
+	merged = true
 	s.releaseSandboxes(ctx, forkID)
 
 	// The copies have served their purpose: left behind they would only be
@@ -379,6 +406,35 @@ func (s *ForkService) Merge(ctx context.Context, forkID primitive.ObjectID, merg
 	}
 
 	return result, nil
+}
+
+// mergeClaimTTL is how long a merge's claim on a fork lasts if the merge never
+// finishes (a crash part way).
+const mergeClaimTTL = 10 * time.Minute
+
+// claimForMerge moves an active fork to "merging", and reports whether this
+// call did.
+func (s *ForkService) claimForMerge(ctx context.Context, forkID primitive.ObjectID) (bool, error) {
+	now := time.Now()
+	result, err := s.db.Collection("content_forks").UpdateOne(ctx,
+		bson.M{"_id": forkID, "$or": bson.A{
+			bson.M{"status": "active"},
+			bson.M{"status": "merging", "merging_at": bson.M{"$lt": now.Add(-mergeClaimTTL)}},
+		}},
+		bson.M{"$set": bson.M{"status": "merging", "merging_at": now}})
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
+// releaseMergeClaim returns a fork whose merge did not complete to "active".
+func (s *ForkService) releaseMergeClaim(ctx context.Context, forkID primitive.ObjectID) {
+	if err := s.db.UpdateOne(ctx, "content_forks",
+		bson.M{"_id": forkID, "status": "merging"},
+		bson.M{"$set": bson.M{"status": "active"}, "$unset": bson.M{"merging_at": ""}}); err != nil {
+		log.Printf("Warning: failed to release the merge claim on fork %s: %v", forkID.Hex(), err)
+	}
 }
 
 // ErrReviewRequired means a merge was attempted without naming the review it
@@ -612,7 +668,10 @@ func mergedFieldValues(c *models.Content) [][2]string {
 
 // pageFingerprint is the part of a page that decides what a merge does.
 func pageFingerprint(c *models.Content) map[string]interface{} {
-	fields := map[string]interface{}{"id": c.ID.Hex(), "data": c.Data, "hold": c.Hold}
+	fields := map[string]interface{}{
+		"id": c.ID.Hex(), "data": c.Data, "hold": c.Hold,
+		"published": c.Published, "publish_at": c.PublishAt,
+	}
 	for _, f := range mergedFieldValues(c) {
 		fields[f[0]] = f[1]
 	}
@@ -637,6 +696,12 @@ func (s *ForkService) Review(ctx context.Context, forkID primitive.ObjectID) (*F
 	if err != nil {
 		return nil, err
 	}
+	return s.reviewOf(ctx, pages)
+}
+
+// reviewOf reviews the given fork pages against the live site.
+func (s *ForkService) reviewOf(ctx context.Context, pages []models.Content) (*ForkReview, error) {
+	pages = append([]models.Content(nil), pages...)
 	sort.Slice(pages, func(i, j int) bool {
 		if pages[i].FullPath != pages[j].FullPath {
 			return pages[i].FullPath < pages[j].FullPath

@@ -7992,7 +7992,8 @@ async function doSearch(q) {
             .review-table pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font-size: 0.8rem; max-height: 32rem; overflow: auto; }
             .review-table .before { background: rgba(239, 68, 68, 0.06); }
             .review-table .after { background: rgba(16, 185, 129, 0.08); }
-            .review-table summary { cursor: pointer; }
+            .review-table summary { cursor: pointer; color: var(--text-muted); font-size: 0.8rem; }
+            .review-table summary .preview { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font-family: monospace; color: var(--text-primary, inherit); }
         </style>
         {{range .Review}}
         <div class="card review-page">
@@ -8009,9 +8010,9 @@ async function doSearch(q) {
                     <tr>
                         <td><code>{{.Name}}</code></td>
                         {{if not .IsNew}}
-                        <td class="before">{{if .LiveLong}}<details><summary><pre>{{.LivePreview}}</pre>Show all</summary><pre>{{.Live}}</pre></details>{{else}}<pre>{{.Live}}</pre>{{end}}</td>
+                        <td class="before">{{if .LiveLong}}<details><summary><span class="preview">{{.LivePreview}}</span> Show all</summary><pre>{{.Live}}</pre></details>{{else}}<pre>{{.Live}}</pre>{{end}}</td>
                         {{end}}
-                        <td class="after">{{if .ForkLong}}<details><summary><pre>{{.ForkPreview}}</pre>Show all</summary><pre>{{.Fork}}</pre></details>{{else}}<pre>{{.Fork}}</pre>{{end}}</td>
+                        <td class="after">{{if .ForkLong}}<details><summary><span class="preview">{{.ForkPreview}}</span> Show all</summary><pre>{{.Fork}}</pre></details>{{else}}<pre>{{.Fork}}</pre>{{end}}</td>
                     </tr>
                     {{end}}
                     </tbody>

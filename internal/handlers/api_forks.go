@@ -265,6 +265,10 @@ func (a *APIHandler) credentialMayMerge(w http.ResponseWriter, r *http.Request, 
 		a.jsonError(w, http.StatusForbidden, "this API key or connection can merge only forks it created; a person merges this one at /cm/forks/"+forkID.Hex())
 		return false
 	}
+	if fork.SubmittedAt != nil {
+		a.jsonError(w, http.StatusForbidden, "this fork was submitted for review, which hands it to a person: they merge it at /cm/forks/"+forkID.Hex())
+		return false
+	}
 	if publishNew && !auth.RoleAndScopesAllow(caller, auth.PermContentPublish) {
 		a.jsonError(w, http.StatusForbidden, "insufficient permissions to publish new pages")
 		return false
@@ -462,6 +466,9 @@ func (a *APIHandler) APIArchiveFork(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusBadRequest, "invalid fork ID")
 		return
 	}
+	if !a.mayWriteForkByID(w, r, forkID) {
+		return
+	}
 	if err := a.forkService.Archive(r.Context(), forkID); err != nil {
 		a.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -529,7 +536,7 @@ func (a *APIHandler) APIDeleteFork(w http.ResponseWriter, r *http.Request) {
 		if !a.requirePermission(w, r, auth.PermForkCreate) || !a.mayWriteForkByID(w, r, forkID) {
 			return
 		}
-	} else if !a.requirePermission(w, r, auth.PermForkMerge) {
+	} else if !a.requirePermission(w, r, auth.PermForkMerge) || !a.mayWriteForkByID(w, r, forkID) {
 		return
 	}
 	if err := a.forkService.Delete(r.Context(), forkID); err != nil {

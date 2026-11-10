@@ -1247,6 +1247,16 @@ func (s *ContentService) RevertToVersion(ctx context.Context, contentID primitiv
 	content.UseFooter = v.UseFooter
 	content.UseTheme = v.UseTheme
 	content.RawMode = v.RawMode
+	// Versions saved before 7.5 don't have these; the page keeps its values.
+	if v.NoIndex != nil {
+		content.NoIndex = *v.NoIndex
+	}
+	if v.AuthorName != nil {
+		content.AuthorName = *v.AuthorName
+	}
+	if v.AuthorURL != nil {
+		content.AuthorURL = *v.AuthorURL
+	}
 
 	// Pass through the version comment if provided
 	return s.UpdateContent(ctx, &content, versionComment...)
@@ -1283,6 +1293,9 @@ func (s *ContentService) saveVersion(ctx context.Context, content *models.Conten
 			UseFooter:       original.UseFooter,
 			UseTheme:        original.UseTheme,
 			RawMode:         original.RawMode,
+			NoIndex:         boolPtr(original.NoIndex),
+			AuthorName:      stringPtr(original.AuthorName),
+			AuthorURL:       stringPtr(original.AuthorURL),
 			CreatedAt:       original.CreatedAt,
 		}
 		if _, err := s.db.InsertOne(ctx, "content_versions", v1); err != nil {
@@ -1324,6 +1337,9 @@ func (s *ContentService) saveVersion(ctx context.Context, content *models.Conten
 		UseFooter:       content.UseFooter,
 		UseTheme:        content.UseTheme,
 		RawMode:         content.RawMode,
+		NoIndex:         boolPtr(content.NoIndex),
+		AuthorName:      stringPtr(content.AuthorName),
+		AuthorURL:       stringPtr(content.AuthorURL),
 		CreatedAt:       time.Now(),
 	}
 
@@ -2277,3 +2293,7 @@ func (s *ContentService) RegenerateAllContent(ctx context.Context) error {
 
 	return nil
 }
+
+func stringPtr(s string) *string { return &s }
+
+func boolPtr(b bool) *bool { return &b }

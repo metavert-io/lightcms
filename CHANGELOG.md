@@ -31,7 +31,8 @@ Agents now act as the person who connected them, the agent sandbox is enforced b
 - `GET /api/v1/sandbox`, `POST /api/v1/sandbox`, `POST /api/v1/sandbox/end`.
 
 ### Changed
-- **Merges are recorded in page history and can be undone.** Each live page a merge creates or changes gets a version with who made the change; `rollback_agent_session` undoes a session's merge. A merged page's static file is rendered from the whole merged page, so its meta description, tags and author render as merged.
+- **Merges are recorded in page history and can be undone.** Each live page a merge creates or changes gets a version with who made the change; `rollback_agent_session` undoes a session's merge. Versions now also record `noindex` and the author, so reverting restores them (older versions leave those fields as they are). A merged page's static file is rendered from the whole merged page, so its meta description, tags and author render as merged.
+- **A fork is claimed while it is merged**, so a second merge of the same fork (an agent retrying, two people at once) is refused instead of applying twice. A new page a merge creates goes live only as the merge says: a schedule set on the fork copy is dropped, and fork copies can't be scheduled.
 - Changes made through `/mcp` are recorded as agent changes with a server-generated agent session; the audit log names the key or connection used.
 - Rate limits count per key or connection rather than per raw token.
 

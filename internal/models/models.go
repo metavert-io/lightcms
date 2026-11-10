@@ -148,7 +148,12 @@ type ContentVersion struct {
 	UseFooter       bool                   `bson:"use_footer" json:"use_footer"`
 	UseTheme        bool                   `bson:"use_theme" json:"use_theme"`
 	RawMode         bool                   `bson:"raw_mode" json:"raw_mode"`
-	CreatedAt       time.Time              `bson:"created_at" json:"created_at"` // When this version was created (saved)
+	// Kept since 7.5 (nil in older versions, which leave the page's value
+	// alone when reverted to).
+	NoIndex    *bool     `bson:"noindex,omitempty" json:"noindex,omitempty"`
+	AuthorName *string   `bson:"author_name,omitempty" json:"author_name,omitempty"`
+	AuthorURL  *string   `bson:"author_url,omitempty" json:"author_url,omitempty"`
+	CreatedAt  time.Time `bson:"created_at" json:"created_at"` // When this version was created (saved)
 }
 
 // Folder represents a directory in the site structure

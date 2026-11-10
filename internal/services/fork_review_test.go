@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -263,6 +264,12 @@ func TestRollback_UndoesASessionsMerge(t *testing.T) {
 		t.Fatalf("Merge: %v", err)
 	}
 	audit := NewAuditService(f.db)
+	// The session also created the page inside the fork; merging removed
+	// that copy, so rollback reports it as gone rather than failing on it.
+	audit.Log(context.Background(), models.AuditLog{
+		Action: "content.create", Resource: "content", ResourceID: newPage.ID.Hex(), AgentSession: session,
+		CreatedAt: time.Now().Add(-time.Minute),
+	})
 	audit.Log(context.Background(), models.AuditLog{
 		Action: "fork.merge", Resource: "fork", ResourceID: f.fork.ID.Hex(), AgentSession: session,
 		Details: map[string]interface{}{
@@ -273,7 +280,7 @@ func TestRollback_UndoesASessionsMerge(t *testing.T) {
 
 	sessions := NewAgentSessionService(audit, f.cs)
 	changes, err := sessions.Changes(context.Background(), session)
-	if err != nil || len(changes.ContentItems) != 2 {
+	if err != nil || len(changes.ContentItems) != 3 {
 		t.Fatalf("ledger: %+v, %v", changes, err)
 	}
 	rollback, err := sessions.Rollback(context.Background(), session)
@@ -282,6 +289,9 @@ func TestRollback_UndoesASessionsMerge(t *testing.T) {
 	}
 	if len(rollback.Reverted) != 1 || len(rollback.Deleted) != 1 {
 		t.Errorf("rollback: %+v", rollback)
+	}
+	if len(rollback.Skipped) != 1 || rollback.Skipped[0].ContentID != newPage.ID.Hex() || !strings.Contains(rollback.Skipped[0].Reason, "no longer exists") {
+		t.Errorf("the merged-away copy: %+v", rollback.Skipped)
 	}
 
 	var live, created models.Content
@@ -303,5 +313,121 @@ func TestSubmit_RecordsTheHandOff(t *testing.T) {
 	fork, _ := f.fs.GetByID(context.Background(), f.fork.ID)
 	if fork.SubmittedAt == nil || fork.SubmittedByEmail != "agent@example.com" || fork.Status != "active" {
 		t.Errorf("after submit: %+v", fork)
+	}
+}
+
+func TestMerge_TwoMergesOfOneForkApplyOnce(t *testing.T) {
+	f := newReviewFixture(t)
+	f.editCopy(t, bson.M{"title": "Merged once"})
+	digest := f.review(t).Digest
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	succeeded := 0
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := f.fs.Merge(context.Background(), f.fork.ID, primitive.NewObjectID(), "m@example.com", false, digest); err == nil {
+				mu.Lock()
+				succeeded++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if succeeded != 1 {
+		t.Errorf("%d merges applied, want 1", succeeded)
+	}
+	versions, _ := f.cs.GetVersions(context.Background(), f.live)
+	if len(versions) != 2 {
+		t.Errorf("%d versions after one merge, want 2", len(versions))
+	}
+}
+
+func TestMerge_AStaleClaimFromACrashedMergeExpires(t *testing.T) {
+	f := newReviewFixture(t)
+	ctx := context.Background()
+	f.editCopy(t, bson.M{"title": "After the crash"})
+	digest := f.review(t).Digest
+
+	// A merge that is still running holds the fork.
+	if err := f.db.UpdateOne(ctx, "content_forks", bson.M{"_id": f.fork.ID}, bson.M{"$set": bson.M{"status": "merging", "merging_at": time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.fs.Merge(ctx, f.fork.ID, primitive.NewObjectID(), "m@example.com", false, digest); err == nil {
+		t.Fatal("merged a fork another merge holds")
+	}
+	// One that crashed long ago doesn't.
+	if err := f.db.UpdateOne(ctx, "content_forks", bson.M{"_id": f.fork.ID}, bson.M{"$set": bson.M{"merging_at": time.Now().Add(-time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.fs.Merge(ctx, f.fork.ID, primitive.NewObjectID(), "m@example.com", false, digest); err != nil {
+		t.Errorf("merging after a stale claim: %v", err)
+	}
+}
+
+func TestMerge_RefusedMergeReleasesTheFork(t *testing.T) {
+	f := newReviewFixture(t)
+	ctx := context.Background()
+	if _, err := f.fs.Merge(ctx, f.fork.ID, primitive.NewObjectID(), "m@example.com", false, "stale"); !errors.Is(err, ErrForkChanged) {
+		t.Fatalf("got %v", err)
+	}
+	fork, _ := f.fs.GetByID(ctx, f.fork.ID)
+	if fork.Status != "active" {
+		t.Errorf("after a refused merge the fork is %q", fork.Status)
+	}
+}
+
+func TestMerge_ANewPageGoesLiveOnlyAsTheMergeSays(t *testing.T) {
+	f := newReviewFixture(t)
+	ctx := context.Background()
+	soon := time.Now().Add(time.Hour)
+	scheduled := &models.Content{ID: primitive.NewObjectID(), Title: "Scheduled in fork", Slug: "sched", FullPath: "/sched", ForkID: &f.fork.ID, PublishAt: &soon, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if _, err := f.db.InsertOne(ctx, "content", scheduled); err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.fs.Merge(ctx, f.fork.ID, primitive.NewObjectID(), "m@example.com", false, f.review(t).Digest)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	for _, id := range result.CreatedIDs {
+		var page models.Content
+		f.db.FindOne(ctx, "content", bson.M{"_id": id}, &page)
+		if page.PublishAt != nil {
+			t.Errorf("%s kept a schedule from the fork", page.FullPath)
+		}
+	}
+}
+
+func TestRevertToVersion_RestoresNoindexAndAuthor(t *testing.T) {
+	f := newReviewFixture(t)
+	ctx := context.Background()
+	f.editCopy(t, bson.M{"noindex": true, "author_name": "Agent", "author_url": "https://agent.example"})
+	if _, err := f.fs.Merge(ctx, f.fork.ID, primitive.NewObjectID(), "m@example.com", false, f.review(t).Digest); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if err := f.cs.RevertToVersion(ctx, f.live, 1, "undo"); err != nil {
+		t.Fatalf("RevertToVersion: %v", err)
+	}
+	var live models.Content
+	f.db.FindOne(ctx, "content", bson.M{"_id": f.live}, &live)
+	if live.NoIndex || live.AuthorName != "" || live.AuthorURL != "" {
+		t.Errorf("after reverting the merge: noindex=%v author=%q url=%q", live.NoIndex, live.AuthorName, live.AuthorURL)
+	}
+
+	// A version from before 7.5 has none of these and leaves them alone.
+	if err := f.db.UpdateOne(ctx, "content", bson.M{"_id": f.live}, bson.M{"$set": bson.M{"author_name": "Kept"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Collection("content_versions").UpdateOne(ctx, bson.M{"content_id": f.live, "version": 1}, bson.M{"$unset": bson.M{"noindex": "", "author_name": "", "author_url": ""}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.cs.RevertToVersion(ctx, f.live, 1, "undo again"); err != nil {
+		t.Fatalf("RevertToVersion: %v", err)
+	}
+	f.db.FindOne(ctx, "content", bson.M{"_id": f.live}, &live)
+	if live.AuthorName != "Kept" {
+		t.Errorf("an old version cleared the author: %q", live.AuthorName)
 	}
 }

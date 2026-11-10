@@ -42,6 +42,12 @@ func (a *APIHandler) APIScheduleContentPublish(w http.ResponseWriter, r *http.Re
 		publishAt = &t
 	}
 
+	// A fork copy goes live only through its fork's merge, never on a schedule.
+	if content, err := a.contentService.GetContent(r.Context(), contentID); err == nil && content.ForkID != nil {
+		a.jsonError(w, http.StatusBadRequest, "a fork copy can't be scheduled; it goes live when its fork is merged")
+		return
+	}
+
 	update := bson.M{"$set": bson.M{"updated_at": time.Now()}}
 	if publishAt != nil {
 		update["$set"].(bson.M)["publish_at"] = *publishAt

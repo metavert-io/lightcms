@@ -157,6 +157,14 @@ func (s *AgentSessionService) Rollback(ctx context.Context, sessionID string) (*
 			continue
 		}
 
+		if _, err := s.content.GetContent(ctx, id); err != nil {
+			// Typically a page copy the session made in a fork that was then
+			// merged: merging removes the copies, and the merge's own entry
+			// covers the live pages.
+			result.Skipped = append(result.Skipped, RollbackSkipReason{item.ContentID, "no longer exists (fork page copies are removed when their fork is merged)"})
+			continue
+		}
+
 		created, deleted := false, false
 		for _, a := range item.Actions {
 			switch a {

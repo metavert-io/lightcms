@@ -88,7 +88,7 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 // fork that it created.
 func (a *APIHandler) callerMayWriteFork(w http.ResponseWriter, r *http.Request, fork *models.ContentFork) bool {
 	user := a.getAPIUser(r)
-	if fork.SubmittedAt != nil && user != nil && user.Credential != "" {
+	if fork.SubmittedAt != nil && fork.Status == "active" && user != nil && user.Credential != "" {
 		a.jsonError(w, http.StatusConflict, "this fork was submitted for review and can't be changed any more; start a new sandbox for further changes")
 		return false
 	}

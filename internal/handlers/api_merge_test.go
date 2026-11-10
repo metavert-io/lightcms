@@ -189,6 +189,9 @@ func TestSubmit_FreezesTheForkForKeysButNotForPeople(t *testing.T) {
 		t.Fatalf("fork-page: %d %s", rr.Code, rr.Body.String())
 	}
 	copyID := decode(t, rr)["id"].(string)
+	if rr := e.send(agent, "PUT", "/api/v1/content/"+copyID, `{"title":"Before submit"}`); rr.Code != http.StatusOK {
+		t.Fatalf("edit before submit: %d %s", rr.Code, rr.Body.String())
+	}
 	if rr := e.send(agent, "POST", "/api/v1/sandbox/end", `{"action":"submit"}`); rr.Code != http.StatusOK {
 		t.Fatalf("submit: %d %s", rr.Code, rr.Body.String())
 	}
@@ -197,6 +200,16 @@ func TestSubmit_FreezesTheForkForKeysButNotForPeople(t *testing.T) {
 		if rr := e.send(key, "PUT", "/api/v1/content/"+copyID, `{"title":"After submit"}`); rr.Code != http.StatusConflict {
 			t.Errorf("%s editing a submitted fork: %d %s", name, rr.Code, rr.Body.String())
 		}
+	}
+	// Every other way a key changes a page copy is frozen too.
+	if rr := e.send(full, "POST", "/api/v1/content/"+copyID+"/versions/1/revert", `{}`); rr.Code != http.StatusConflict {
+		t.Errorf("reverting a copy in a submitted fork: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := e.send(full, "DELETE", "/api/v1/content/"+copyID, ``); rr.Code != http.StatusConflict {
+		t.Errorf("deleting a copy in a submitted fork: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := e.send(full, "POST", "/api/v1/content/"+copyID+"/schedule", `{"publish_at":"2030-01-01T00:00:00Z"}`); rr.Code != http.StatusBadRequest {
+		t.Errorf("scheduling a fork copy: %d %s", rr.Code, rr.Body.String())
 	}
 	if rr := e.send(agent, "DELETE", "/api/v1/forks/"+fork, ``); rr.Code != http.StatusConflict {
 		t.Errorf("the agent discarding its submitted fork: %d %s", rr.Code, rr.Body.String())
@@ -268,5 +281,33 @@ func TestForkPage_ShowsTheReviewAndMergesOnlyWhatWasShown(t *testing.T) {
 	h.db.FindOne(ctx, "content", bson.M{"_id": live}, &livePage)
 	if livePage.Title != "Swapped" {
 		t.Errorf("after merging as reviewed: %q", livePage.Title)
+	}
+}
+
+func TestSubmit_HandsTheForkToAPerson(t *testing.T) {
+	e := newSandboxEnvAs(t, models.RoleAdmin)
+	agent := e.key(t, "Agent", true)
+	e.allowMerge(t, agent, true)
+	admin := e.key(t, "Admin's Full key", false)
+
+	fork := e.startSandbox(t, agent)
+	e.editInFork(t, agent, fork, "Submitted change")
+	if rr := e.send(agent, "POST", "/api/v1/sandbox/end", `{"action":"submit"}`); rr.Code != http.StatusOK {
+		t.Fatalf("submit: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// The agent handed it off: it can't merge it any more, even with the permission.
+	if rr := e.merge(agent, fork, e.digest(t, agent, fork)); rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "submitted for review") {
+		t.Errorf("self-merging a submitted fork: %d %s", rr.Code, rr.Body.String())
+	}
+	// No key archives or deletes it either; a person does.
+	if rr := e.send(admin, "POST", "/api/v1/forks/"+fork+"/archive", ``); rr.Code != http.StatusConflict {
+		t.Errorf("a key archiving a submitted fork: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := e.send(admin, "DELETE", "/api/v1/forks/"+fork, ``); rr.Code != http.StatusConflict {
+		t.Errorf("a key deleting a submitted fork: %d %s", rr.Code, rr.Body.String())
+	}
+	if e.liveTitle(t) != "Live" {
+		t.Errorf("live title %q", e.liveTitle(t))
 	}
 }
