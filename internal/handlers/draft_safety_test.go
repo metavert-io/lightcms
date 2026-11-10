@@ -513,7 +513,11 @@ func TestAdminForkMerge_PublishNewAndMergedView(t *testing.T) {
 		t.Errorf("ViewFork (active): %d, publish_new checkbox present = %v", rr.Code, strings.Contains(rr.Body.String(), `name="publish_new"`))
 	}
 
-	rr := postForm(t, h.MergeFork, url.Values{"publish_new": {"on"}}, vars)
+	review, err := h.forkService.Review(context.Background(), forkID)
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	rr := postForm(t, h.MergeFork, url.Values{"publish_new": {"on"}, "digest": {review.Digest}}, vars)
 	if rr.Code != 200 {
 		t.Fatalf("MergeFork: %d %s", rr.Code, rr.Body.String())
 	}

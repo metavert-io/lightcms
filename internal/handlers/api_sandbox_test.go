@@ -353,9 +353,9 @@ func TestSandbox_ConnectionsWriteOnlyToTheirOwnForks(t *testing.T) {
 		t.Errorf("sandbox key editing live after submit: %d %s", rr.Code, rr.Body.String())
 	}
 
-	// It can still discard the fork it made; nobody else's.
-	if rr := e.send(mine, "DELETE", "/api/v1/forks/"+fork, ``); rr.Code != http.StatusOK {
-		t.Errorf("discarding own fork: %d %s", rr.Code, rr.Body.String())
+	// Submitted means handed off: it can't discard the fork any more either.
+	if rr := e.send(mine, "DELETE", "/api/v1/forks/"+fork, ``); rr.Code != http.StatusConflict {
+		t.Errorf("discarding its submitted fork: %d %s", rr.Code, rr.Body.String())
 	}
 }
 
