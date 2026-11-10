@@ -40,9 +40,7 @@ func (s *Server) registerResources() {
 	)
 }
 
-func (s *Server) handleSiteStructure(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-	ctx := context.Background()
-
+func (s *Server) handleSiteStructure(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	folders, err := s.client.ListFolders(ctx)
 	if err != nil {
 		return nil, err
@@ -75,9 +73,7 @@ func (s *Server) handleSiteStructure(_ context.Context, req *mcp.ReadResourceReq
 	}, nil
 }
 
-func (s *Server) handleRecentContent(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-	ctx := context.Background()
-
+func (s *Server) handleRecentContent(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	content, err := s.client.ListContent(ctx, false, "", "")
 	if err != nil {
 		return nil, err
@@ -106,9 +102,7 @@ func (s *Server) handleRecentContent(_ context.Context, req *mcp.ReadResourceReq
 	}, nil
 }
 
-func (s *Server) handleThemeConfig(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-	ctx := context.Background()
-
+func (s *Server) handleThemeConfig(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	theme, err := s.client.GetTheme(ctx)
 	if err != nil {
 		return nil, err

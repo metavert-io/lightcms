@@ -16,6 +16,15 @@ type Server struct {
 	mcpServer *mcp.Server
 	client    *apiclient.Client
 	sandbox   sandboxState
+	// localFiles lets upload_asset read file_path from this machine's disk.
+	localFiles bool
+}
+
+// AllowLocalFiles lets upload_asset read a file_path from the local disk. Only
+// the stdio server calls it: it runs on the user's own machine, on the user's
+// behalf. On the hosted endpoint the local disk is the server's.
+func (s *Server) AllowLocalFiles() {
+	s.localFiles = true
 }
 
 // NewServer creates a new MCP server with all tools registered

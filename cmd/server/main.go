@@ -26,8 +26,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func main() {
@@ -282,80 +280,23 @@ func main() {
 	apiHandler.SetSEOService(seoService)
 	apiHandler.SetAnalyticsService(analyticsService)
 	apiHandler.SetBaseURL(cfg.BaseURL)
-	apiAuthMiddleware := middleware.NewAPIAuth(func(ctx context.Context, rawKey string) (interface{}, error) {
-		apiKey, err := apiKeyService.ValidateAPIKey(ctx, rawKey)
-		if err != nil {
-			return nil, err
-		}
-		// Resolve the user who owns this API key
-		if apiKey.UserID != nil {
-			user, err := userService.GetByID(ctx, *apiKey.UserID)
-			if err == nil && user != nil {
-				go analyticsService.RecordActivity(context.Background(), user.ID.Hex())
-				return &auth.SessionUser{
-					ID:          user.ID.Hex(),
-					Email:       user.Email,
-					Role:        user.Role,
-					ViaAPIKey:   true,
-					Scopes:      apiKey.Scopes,
-					SandboxOnly: apiKey.SandboxOnly,
-				}, nil
-			}
-		}
-		// Legacy key without user association — auto-migrate by associating with the first admin user.
-		log.Printf("[security] API key %s... has no user — attempting auto-migration to admin user", rawKey[:min(10, len(rawKey))])
-		if adminUsers, err := userService.ListUsers(ctx); err == nil {
-			for _, u := range adminUsers {
-				if u.Role == models.RoleAdmin && !u.Disabled {
-					uid := u.ID
-					db.UpdateOne(ctx, "api_keys", bson.M{"_id": apiKey.ID}, bson.M{"$set": bson.M{"user_id": uid}})
-					log.Printf("[security] Auto-migrated legacy API key to admin user %s", u.Email)
-					go analyticsService.RecordActivity(context.Background(), u.ID.Hex())
-					return &auth.SessionUser{
-						ID:        u.ID.Hex(),
-						Email:     u.Email,
-						Role:      u.Role,
-						ViaAPIKey: true,
-					}, nil
-				}
-			}
-		}
-		// No admin user found — reject the key
-		return nil, fmt.Errorf("legacy key has no user and no admin user available for migration")
-	})
-
-	// OAuth 2.1 setup for MCP Cowork connector support
+	// OAuth 2.1 setup for MCP connector support. API keys and OAuth tokens both
+	// resolve to the person they act for, on every request.
 	oauthService := services.NewOAuthService(db)
-	// Find an admin user to associate with the system API key so OAuth-authenticated
-	// MCP sessions resolve to admin-level permissions (not nil → permission bypass).
-	var systemKeyAdminID *primitive.ObjectID
-	if adminUsers, err := userService.ListUsers(context.Background()); err == nil {
-		for _, u := range adminUsers {
-			if u.Role == models.RoleAdmin && !u.Disabled {
-				id := u.ID
-				systemKeyAdminID = &id
-				break
-			}
-		}
-	}
-	systemAPIKey, err := services.EnsureSystemAPIKey(context.Background(), db, apiKeyService, systemKeyAdminID)
-	if err != nil {
-		log.Fatalf("Failed to create system API key: %v", err)
-	}
+	credentials := auth.NewCredentialResolver(userService, apiKeyService, oauthService,
+		services.MCPResourceURL(cfg.BaseURL),
+		func(userID string) { go analyticsService.RecordActivity(context.Background(), userID) })
+	apiAuthMiddleware := middleware.NewAPIAuth(credentials.ResolveAPIKey)
 	resourceMetadataURL := cfg.BaseURL + "/.well-known/oauth-protected-resource"
-	apiAuthMiddleware.SetOAuth(
-		func(ctx context.Context, rawToken string) (interface{}, error) {
-			_, err := oauthService.ValidateAccessToken(ctx, rawToken)
-			if err != nil {
-				return nil, err
-			}
-			// OAuth tokens go through the system API key path — no specific user context
-			// (the system key will be resolved on the subsequent internal request)
-			return nil, nil
-		},
-		systemAPIKey,
-		resourceMetadataURL,
-	)
+	apiAuthMiddleware.SetOAuth(credentials.ResolveOAuthToken, resourceMetadataURL)
+
+	// OAuth sessions used to share one stored admin key; remove it if it is still here.
+	if removed, err := services.RemoveLegacySystemKey(context.Background(), db); err != nil {
+		log.Printf("Warning: failed to remove the legacy system API key: %v", err)
+	} else if removed {
+		log.Printf("Removed the legacy system API key")
+	}
+
 	oauthHandler := oauth.NewHandler(oauthService, authManager, cfg.BaseURL, cfg.SessionSecret)
 
 	// Allow browser-based admin UI calls to /api/v1/ using session cookies (no Bearer token required).
@@ -372,215 +313,7 @@ func main() {
 		return user
 	}, middleware.CSRFProtectAPI(csrfKey, cfg.SecureCookies))
 
-	apiv1 := r.PathPrefix("/api/v1").Subrouter()
-	apiv1.Use(apiAuthMiddleware.Middleware)
-	apiv1.Use(middleware.APIBurstRateLimit) // per-token burst limit (20 req/s)
-	apiv1.Use(middleware.APIRateLimit)      // per-token sliding-window rate limit (300 req/min)
-	apiv1.Use(middleware.APIBodySizeLimit)  // cap request body at 10 MiB to prevent memory exhaustion
-	// Stamp change provenance (and version attribution) on every API request:
-	// agent sessions are identified by the X-Agent-Session header.
-	apiv1.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := r.Context()
-			prov := services.Provenance{Actor: "human", Via: "api"}
-			if sess := r.Header.Get("X-Agent-Session"); sess != "" {
-				prov.Actor = "agent"
-				prov.AgentSession = sess
-			}
-			ctx = services.WithProvenance(ctx, prov)
-			if u, ok := auth.UserFromAPIContext(ctx); ok && u != nil {
-				ctx = services.WithEditorEmail(ctx, u.Email)
-			}
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
-	})
-
-	// Content
-	apiv1.HandleFunc("/content", apiHandler.APIListContent).Methods("GET")
-	apiv1.HandleFunc("/content", apiHandler.APICreateContent).Methods("POST")
-	apiv1.HandleFunc("/content/by-path", apiHandler.APIGetContentByPath).Methods("GET")
-	apiv1.HandleFunc("/content/by-path", apiHandler.APIUpdateContentByPath).Methods("PUT")
-	apiv1.HandleFunc("/content/backlinks", apiHandler.APIGetBacklinks).Methods("GET")
-	apiv1.HandleFunc("/content/batch-publish", apiHandler.APIBatchPublishContent).Methods("POST")
-	apiv1.Handle("/content/bulk-create", middleware.BulkUpdateLimiter()(http.HandlerFunc(apiHandler.APIBulkCreateContent))).Methods("POST")
-	apiv1.Handle("/content/bulk-update", middleware.BulkUpdateLimiter()(http.HandlerFunc(apiHandler.APIBulkUpdateContent))).Methods("POST")
-	apiv1.Handle("/content/bulk-field-op", middleware.BulkUpdateLimiter()(http.HandlerFunc(apiHandler.APIBulkFieldOperation))).Methods("POST")
-	apiv1.Handle("/content/export", middleware.ExportLimiter()(http.HandlerFunc(apiHandler.APIExportContent))).Methods("POST")
-	apiv1.HandleFunc("/content/{id}", apiHandler.APIGetContent).Methods("GET")
-	apiv1.HandleFunc("/content/{id}", apiHandler.APIUpdateContent).Methods("PUT")
-	apiv1.HandleFunc("/content/{id}", apiHandler.APIDeleteContent).Methods("DELETE")
-	apiv1.HandleFunc("/content/{id}/restore", apiHandler.APIRestoreContent).Methods("POST")
-	apiv1.HandleFunc("/content/{id}/publish", apiHandler.APIPublishContent).Methods("POST")
-	apiv1.HandleFunc("/content/{id}/unpublish", apiHandler.APIUnpublishContent).Methods("POST")
-	apiv1.HandleFunc("/content/{id}/preview", apiHandler.APIPreviewContent).Methods("GET", "POST")
-	apiv1.HandleFunc("/content/{id}/versions", apiHandler.APIListContentVersions).Methods("GET")
-	apiv1.HandleFunc("/content/{id}/versions/{version}", apiHandler.APIGetContentVersion).Methods("GET")
-	apiv1.HandleFunc("/content/{id}/versions/{version}/revert", apiHandler.APIRevertContentVersion).Methods("POST")
-
-	// Templates
-	apiv1.HandleFunc("/templates", apiHandler.APIListTemplates).Methods("GET")
-	apiv1.HandleFunc("/templates", apiHandler.APICreateTemplate).Methods("POST")
-	apiv1.HandleFunc("/templates/{id}", apiHandler.APIGetTemplate).Methods("GET")
-	apiv1.HandleFunc("/templates/{id}", apiHandler.APIUpdateTemplate).Methods("PUT")
-	apiv1.HandleFunc("/templates/{id}", apiHandler.APIDeleteTemplate).Methods("DELETE")
-
-	// Assets
-	apiv1.HandleFunc("/assets", apiHandler.APIListAssets).Methods("GET")
-	apiv1.HandleFunc("/assets", apiHandler.APIUploadAsset).Methods("POST")
-	apiv1.Handle("/assets/from-url", middleware.AssetFromURLLimiter()(http.HandlerFunc(apiHandler.APIUploadAssetFromURL))).Methods("POST")
-	apiv1.HandleFunc("/assets/folders", apiHandler.APIListAssetFolders).Methods("GET")
-	apiv1.HandleFunc("/assets/by-path", apiHandler.APIGetAssetByPath).Methods("GET")
-	apiv1.HandleFunc("/assets/{id}", apiHandler.APIGetAsset).Methods("GET")
-	apiv1.HandleFunc("/assets/{id}", apiHandler.APIDeleteAsset).Methods("DELETE")
-
-	// Theme
-	apiv1.HandleFunc("/theme", apiHandler.APIGetTheme).Methods("GET")
-	apiv1.HandleFunc("/theme", apiHandler.APIUpdateTheme).Methods("PUT")
-	apiv1.HandleFunc("/theme/versions", apiHandler.APIListThemeVersions).Methods("GET")
-	apiv1.HandleFunc("/theme/versions/{version}", apiHandler.APIGetThemeVersion).Methods("GET")
-	apiv1.HandleFunc("/theme/versions/{version}/revert", apiHandler.APIRevertThemeVersion).Methods("POST")
-	apiv1.HandleFunc("/theme/versions/{version}/pin", apiHandler.APIPinThemeVersion).Methods("POST")
-	apiv1.HandleFunc("/theme/versions/{version}/unpin", apiHandler.APIPinThemeVersion).Methods("POST")
-
-	// Site Config
-	apiv1.HandleFunc("/config", apiHandler.APIGetSiteConfig).Methods("GET")
-	apiv1.HandleFunc("/config", apiHandler.APIUpdateSiteConfig).Methods("PUT")
-
-	// Redirects
-	apiv1.HandleFunc("/redirects", apiHandler.APIListRedirects).Methods("GET")
-	apiv1.HandleFunc("/redirects", apiHandler.APICreateRedirect).Methods("POST")
-	apiv1.HandleFunc("/redirects/{id}", apiHandler.APIGetRedirect).Methods("GET")
-	apiv1.HandleFunc("/redirects/{id}", apiHandler.APIUpdateRedirect).Methods("PUT")
-	apiv1.HandleFunc("/redirects/{id}", apiHandler.APIDeleteRedirect).Methods("DELETE")
-
-	// Folders
-	apiv1.HandleFunc("/folders", apiHandler.APIListFolders).Methods("GET")
-	apiv1.HandleFunc("/folders", apiHandler.APICreateFolder).Methods("POST")
-	apiv1.HandleFunc("/folders/{id}", apiHandler.APIGetFolder).Methods("GET")
-	apiv1.HandleFunc("/folders/{id}", apiHandler.APIDeleteFolder).Methods("DELETE")
-
-	// Collections
-	apiv1.HandleFunc("/collections", apiHandler.APIListCollections).Methods("GET")
-	apiv1.HandleFunc("/collections", apiHandler.APICreateCollection).Methods("POST")
-	apiv1.HandleFunc("/collections/{id}", apiHandler.APIGetCollection).Methods("GET")
-	apiv1.HandleFunc("/collections/{id}", apiHandler.APIUpdateCollection).Methods("PUT")
-	apiv1.HandleFunc("/collections/{id}", apiHandler.APIDeleteCollection).Methods("DELETE")
-
-	// Search
-	apiv1.HandleFunc("/search", apiHandler.APISearchContent).Methods("GET")
-	apiv1.HandleFunc("/search-replace/preview", apiHandler.APISearchReplacePreview).Methods("POST")
-	apiv1.Handle("/search-replace/execute", middleware.SearchReplaceExecuteLimiter()(http.HandlerFunc(apiHandler.APISearchReplaceExecute))).Methods("POST")
-	apiv1.HandleFunc("/search-replace/scoped/preview", apiHandler.APIScopedSearchReplacePreview).Methods("POST")
-	apiv1.Handle("/search-replace/scoped/execute", middleware.SearchReplaceExecuteLimiter()(http.HandlerFunc(apiHandler.APIScopedSearchReplaceExecute))).Methods("POST")
-
-	// End-user search (authenticated API)
-	apiv1.HandleFunc("/end-user-search", apiHandler.APIEndUserSearch).Methods("GET")
-	apiv1.HandleFunc("/end-user-search/suggest", apiHandler.APIEndUserSearchSuggest).Methods("GET")
-	apiv1.Handle("/reindex-embeddings", middleware.ReindexLimiter()(http.HandlerFunc(apiHandler.APIReindexEmbeddings))).Methods("POST")
-
-	// API Keys
-	apiv1.HandleFunc("/api-keys", apiHandler.APIListAPIKeys).Methods("GET")
-	apiv1.HandleFunc("/api-keys", apiHandler.APICreateAPIKey).Methods("POST")
-	apiv1.HandleFunc("/api-keys/{id}", apiHandler.APIDeleteAPIKey).Methods("DELETE")
-
-	// Snippets
-	apiv1.HandleFunc("/snippets", apiHandler.APIListSnippets).Methods("GET")
-	apiv1.HandleFunc("/snippets", apiHandler.APICreateSnippet).Methods("POST")
-	apiv1.HandleFunc("/snippets/{id}", apiHandler.APIGetSnippet).Methods("GET")
-	apiv1.HandleFunc("/snippets/{id}", apiHandler.APIUpdateSnippet).Methods("PUT")
-	apiv1.HandleFunc("/snippets/{id}", apiHandler.APIDeleteSnippet).Methods("DELETE")
-
-	// Forks
-	apiv1.HandleFunc("/forks", apiHandler.APIListForks).Methods("GET")
-	apiv1.HandleFunc("/forks", apiHandler.APICreateFork).Methods("POST")
-	apiv1.HandleFunc("/forks/{id}", apiHandler.APIGetFork).Methods("GET")
-	apiv1.HandleFunc("/forks/{id}", apiHandler.APIDeleteFork).Methods("DELETE")
-	apiv1.HandleFunc("/forks/{id}/fork-page", apiHandler.APIForkPage).Methods("POST")
-	apiv1.HandleFunc("/forks/{id}/pages", apiHandler.APIListForkPages).Methods("GET")
-	apiv1.HandleFunc("/forks/{id}/pages/{pageID}", apiHandler.APIRemoveForkPage).Methods("DELETE")
-	apiv1.HandleFunc("/forks/{id}/diff", apiHandler.APIForkDiff).Methods("GET")
-
-	// Agent session ledger & rollback
-	apiv1.HandleFunc("/agent-sessions/{id}/changes", apiHandler.APIAgentSessionChanges).Methods("GET")
-	apiv1.HandleFunc("/agent-sessions/{id}/rollback", apiHandler.APIAgentSessionRollback).Methods("POST")
-
-	// Maintenance scans (self-maintaining site routines)
-	apiv1.HandleFunc("/maintenance/report", apiHandler.APIMaintenanceReport).Methods("GET")
-	apiv1.HandleFunc("/indexnow", apiHandler.APIIndexNowStatus).Methods("GET")
-	apiv1.HandleFunc("/seo", apiHandler.APIGetSEO).Methods("GET")
-	apiv1.HandleFunc("/seo", apiHandler.APIUpdateSEO).Methods("PUT")
-	apiv1.HandleFunc("/analytics/ai", apiHandler.APIAITraffic).Methods("GET")
-	apiv1.HandleFunc("/indexnow", apiHandler.APIIndexNowUpdate).Methods("PUT")
-	apiv1.HandleFunc("/indexnow/submit", apiHandler.APIIndexNowSubmit).Methods("POST")
-	apiv1.HandleFunc("/maintenance/scan", apiHandler.APIMaintenanceScan).Methods("POST")
-	apiv1.HandleFunc("/maintenance/backfill-published-dates", apiHandler.APIBackfillPublishedDates).Methods("POST")
-	apiv1.HandleFunc("/maintenance/repair-fork-damage", apiHandler.APIRepairForkDamage).Methods("POST")
-	apiv1.HandleFunc("/forks/{id}/merge", apiHandler.APIMergeFork).Methods("POST")
-	apiv1.HandleFunc("/forks/{id}/archive", apiHandler.APIArchiveFork).Methods("POST")
-	apiv1.HandleFunc("/forks/{id}/purge-copies", apiHandler.APIPurgeForkCopies).Methods("POST")
-
-	// Regenerate (rate-limited: 2/min — full rebuild is expensive)
-	apiv1.Handle("/regenerate", middleware.RegenerateLimiter()(http.HandlerFunc(apiHandler.APIRegenerateAllContent))).Methods("POST")
-
-	// Webhooks API
-	apiv1.HandleFunc("/webhooks", apiHandler.APIListWebhooks).Methods("GET")
-	apiv1.HandleFunc("/webhooks", apiHandler.APICreateWebhook).Methods("POST")
-	apiv1.HandleFunc("/webhooks/{id}", apiHandler.APIUpdateWebhook).Methods("PUT")
-	apiv1.HandleFunc("/webhooks/{id}", apiHandler.APIDeleteWebhook).Methods("DELETE")
-	apiv1.HandleFunc("/webhooks/{id}/regenerate-secret", apiHandler.APIRegenerateWebhookSecret).Methods("POST")
-	apiv1.HandleFunc("/webhooks/{id}/deliveries", apiHandler.APIListWebhookDeliveries).Methods("GET")
-
-	// Content locks API
-	apiv1.HandleFunc("/content/{id}/lock", apiHandler.APIGetContentLock).Methods("GET")
-	apiv1.HandleFunc("/content/{id}/lock", apiHandler.APIAcquireContentLock).Methods("POST")
-	apiv1.HandleFunc("/content/{id}/lock", apiHandler.APIReleaseContentLock).Methods("DELETE")
-	apiv1.HandleFunc("/content/{id}/lock/force", apiHandler.APIForceUnlockContent).Methods("POST")
-
-	// Scheduled publish API
-	apiv1.HandleFunc("/content/scheduled", apiHandler.APIListScheduledContent).Methods("GET")
-	apiv1.HandleFunc("/content/{id}/schedule", apiHandler.APIScheduleContentPublish).Methods("POST")
-
-	// Audit log API
-	apiv1.HandleFunc("/audit", apiHandler.APIListAuditLogs).Methods("GET")
-
-	// Link check API
-	apiv1.HandleFunc("/link-check", apiHandler.APIStartLinkCheck).Methods("POST")
-	apiv1.HandleFunc("/link-check/{id}", apiHandler.APIGetLinkCheckJob).Methods("GET")
-
-	// Import pipeline
-	apiv1.HandleFunc("/imports/sources", apiHandler.APIListImportSources).Methods("GET")
-	apiv1.HandleFunc("/imports/sources", apiHandler.APICreateImportSource).Methods("POST")
-	apiv1.HandleFunc("/imports/sources/{id}", apiHandler.APIUpdateImportSource).Methods("PUT")
-	apiv1.HandleFunc("/imports/sources/{id}", apiHandler.APIDeleteImportSource).Methods("DELETE")
-	apiv1.HandleFunc("/imports/sources/{id}/trigger", apiHandler.APITriggerImportSource).Methods("POST")
-	apiv1.HandleFunc("/imports/markdown", apiHandler.APIImportMarkdown).Methods("POST")
-	apiv1.HandleFunc("/imports/csv", apiHandler.APIImportCSV).Methods("POST")
-	apiv1.HandleFunc("/imports/jobs", apiHandler.APIListImportJobs).Methods("GET")
-	apiv1.HandleFunc("/imports/jobs/{id}", apiHandler.APIGetImportJob).Methods("GET")
-	apiv1.HandleFunc("/imports/jobs/{id}/cancel", apiHandler.APICancelImportJob).Methods("POST")
-
-	// Comments API
-	apiv1.HandleFunc("/content/{id}/comments", apiHandler.APIListComments).Methods("GET")
-	apiv1.Handle("/content/{id}/comments", middleware.CommentCreateLimiter()(http.HandlerFunc(apiHandler.APICreateComment))).Methods("POST")
-	apiv1.HandleFunc("/content/{id}/comments/{cid}", apiHandler.APIDeleteComment).Methods("DELETE")
-	apiv1.HandleFunc("/content/{id}/submit-approval", apiHandler.APISubmitForApproval).Methods("POST")
-
-	// Users list (for @mention and approver search in UI)
-	apiv1.HandleFunc("/users", apiHandler.APIListUsers).Methods("GET")
-
-	// Approval workflows API
-	apiv1.HandleFunc("/approval-workflows", apiHandler.APIListApprovalWorkflows).Methods("GET")
-	apiv1.HandleFunc("/approval-workflows", apiHandler.APICreateApprovalWorkflow).Methods("POST")
-	apiv1.HandleFunc("/approval-workflows/{id}", apiHandler.APIGetApprovalWorkflow).Methods("GET")
-	apiv1.HandleFunc("/approval-workflows/{id}", apiHandler.APIUpdateApprovalWorkflow).Methods("PUT")
-	apiv1.HandleFunc("/approval-workflows/{id}", apiHandler.APIDeleteApprovalWorkflow).Methods("DELETE")
-
-	// Approval requests API
-	apiv1.HandleFunc("/approval-requests", apiHandler.APIListApprovalRequests).Methods("GET")
-	apiv1.HandleFunc("/approval-requests/{id}", apiHandler.APIGetApprovalRequest).Methods("GET")
-	apiv1.HandleFunc("/approval-requests/{id}/approve", apiHandler.APIApproveRequest).Methods("POST")
-	apiv1.HandleFunc("/approval-requests/{id}/reject", apiHandler.APIRejectRequest).Methods("POST")
-	apiv1.HandleFunc("/approval-requests/{id}/cancel", apiHandler.APICancelRequest).Methods("POST")
+	apiv1 := apiHandler.MountAPI(r, apiAuthMiddleware)
 
 	// API routes for AJAX (admin panel internal use)
 	// Note: Most API routes require authentication (checked in handlers)
@@ -602,16 +335,16 @@ func main() {
 	api.HandleFunc("/chat/config", h.ChatWidgetConfigPublic).Methods("GET")                // Public chat widget config (for JS widget)
 
 	// OAuth 2.1 endpoints (no auth middleware — these implement their own auth)
-	r.HandleFunc("/oauth/register", oauthHandler.Register).Methods("POST")
+	r.Handle("/oauth/register", middleware.OAuthRegisterLimiter(proxyConfig)(http.HandlerFunc(oauthHandler.Register))).Methods("POST")
 	r.HandleFunc("/oauth/authorize", oauthHandler.Authorize).Methods("GET")
 	r.HandleFunc("/oauth/authorize", oauthHandler.AuthorizeSubmit).Methods("POST")
 	r.HandleFunc("/oauth/token", oauthHandler.Token).Methods("POST")
 	r.HandleFunc("/oauth/revoke", oauthHandler.TokenRevocation).Methods("POST")
 
 	// MCP Streamable HTTP endpoint (API key + OAuth authenticated)
-	mcpHandler := lightmcp.NewHTTPHandler(cfg.Port)
+	mcpHandler := lightmcp.NewHTTPHandler(apiv1, resourceMetadataURL)
 	mcpSubrouter := r.PathPrefix("/mcp").Subrouter()
-	mcpSubrouter.Use(apiAuthMiddleware.Middleware)
+	mcpSubrouter.Use(apiAuthMiddleware.MCPMiddleware)
 	mcpSubrouter.Handle("", mcpHandler)
 
 	// Public read-only MCP endpoint — no auth; lets visitors' agents search

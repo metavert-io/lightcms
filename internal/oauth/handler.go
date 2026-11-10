@@ -11,19 +11,32 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
+	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/services"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-const loginProofMaxAge = 5 * time.Minute
+const (
+	loginProofMaxAge = 5 * time.Minute
+
+	// Limits on what an unauthenticated client may register.
+	maxRegistrationBody = 16 << 10
+	maxClientNameLength = 100
+	maxRedirectURIs     = 10
+)
 
 // Handler implements OAuth 2.1 endpoints for MCP authorization
 type Handler struct {
 	oauthService  *services.OAuthService
 	authManager   *auth.Manager
 	baseURL       string
+	resource      string // the one resource tokens are issued for: this server's MCP endpoint
 	sessionSecret string
 	tmpl          *template.Template
 }
@@ -34,6 +47,7 @@ func NewHandler(oauthService *services.OAuthService, authManager *auth.Manager, 
 		oauthService:  oauthService,
 		authManager:   authManager,
 		baseURL:       baseURL,
+		resource:      services.MCPResourceURL(baseURL),
 		sessionSecret: sessionSecret,
 	}
 	h.tmpl = template.Must(template.New("authorize").Parse(oauthTemplates["authorize"]))
@@ -43,6 +57,7 @@ func NewHandler(oauthService *services.OAuthService, authManager *auth.Manager, 
 // Register handles Dynamic Client Registration (RFC 7591)
 // POST /oauth/register
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRegistrationBody)
 	var req struct {
 		ClientName    string   `json:"client_name"`
 		RedirectURIs  []string `json:"redirect_uris"`
@@ -54,12 +69,23 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.ClientName = cleanClientName(req.ClientName)
 	if req.ClientName == "" {
 		req.ClientName = "Unknown Client"
 	}
 	if len(req.RedirectURIs) == 0 {
 		jsonError(w, http.StatusBadRequest, "invalid_request", "redirect_uris is required")
 		return
+	}
+	if len(req.RedirectURIs) > maxRedirectURIs {
+		jsonError(w, http.StatusBadRequest, "invalid_redirect_uri", "Too many redirect_uris")
+		return
+	}
+	for _, uri := range req.RedirectURIs {
+		if err := services.ValidateRedirectURI(uri); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
+			return
+		}
 	}
 
 	client, rawSecret, err := h.oauthService.RegisterClient(r.Context(), req.ClientName, req.RedirectURIs)
@@ -115,6 +141,12 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resource, ok := h.resolveResource(resource)
+	if !ok {
+		redirectWithError(w, r, redirectURI, state, "invalid_target", "This server only issues tokens for "+h.resource)
+		return
+	}
+
 	// Render login page
 	h.renderAuthorize(w, map[string]interface{}{
 		"ShowLogin":           true,
@@ -155,6 +187,18 @@ func (h *Handler) AuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if action == "login" || action == "approve" {
+		if responseType != "code" || codeChallenge == "" || codeChallengeMethod != "S256" {
+			jsonError(w, http.StatusBadRequest, "invalid_request", "response_type=code and PKCE with S256 are required")
+			return
+		}
+		var ok bool
+		if resource, ok = h.resolveResource(resource); !ok {
+			redirectWithError(w, r, redirectURI, state, "invalid_target", "This server only issues tokens for "+h.resource)
+			return
+		}
+	}
+
 	templateData := map[string]interface{}{
 		"ClientID":            clientID,
 		"RedirectURI":         redirectURI,
@@ -190,29 +234,58 @@ func (h *Handler) AuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 
 		h.authManager.ClearRateLimit(r.Context(), r)
 
+		if user.IsDefaultPassword {
+			templateData["ShowLogin"] = true
+			templateData["Error"] = "Set a new password in the admin dashboard before connecting an app."
+			h.renderAuthorize(w, templateData)
+			return
+		}
+
 		// Password valid — show consent page with login proof
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		proof := h.computeLoginProof(clientID, redirectURI, codeChallenge, ts)
+		userID := user.ID.Hex()
 
 		templateData["ShowLogin"] = false
 		templateData["ClientName"] = client.ClientName
-		templateData["LoginProof"] = proof
+		templateData["RedirectHost"] = redirectHost(redirectURI)
+		templateData["UserEmail"] = user.Email
+		templateData["UserRole"] = user.Role
+		templateData["RoleSummary"] = roleSummary(user.Role)
+		templateData["LoginUser"] = userID
+		templateData["LoginProof"] = h.computeLoginProof(userID, clientID, redirectURI, codeChallenge, resource, ts)
 		templateData["LoginTS"] = ts
 		h.renderAuthorize(w, templateData)
 
 	case "approve":
+		loginUser := r.FormValue("login_user")
 		loginProof := r.FormValue("login_proof")
 		loginTS := r.FormValue("login_ts")
 
-		if !h.verifyLoginProof(clientID, redirectURI, codeChallenge, loginTS, loginProof) {
+		if !h.verifyLoginProof(loginUser, clientID, redirectURI, codeChallenge, resource, loginTS, loginProof) {
 			templateData["ShowLogin"] = true
 			templateData["Error"] = "Session expired. Please sign in again."
 			h.renderAuthorize(w, templateData)
 			return
 		}
 
+		// The account may have changed since the password was checked.
+		user := h.approvingUser(r, loginUser)
+		if user == nil {
+			templateData["ShowLogin"] = true
+			templateData["Error"] = "This account can't connect apps. Please sign in again."
+			h.renderAuthorize(w, templateData)
+			return
+		}
+
+		grant, err := h.oauthService.SaveGrant(r.Context(), client, user.ID, resource)
+		if err != nil {
+			log.Printf("[OAuth] Failed to save grant: %v", err)
+			redirectWithError(w, r, redirectURI, state, "server_error", "Failed to record the connection")
+			return
+		}
+
 		// Generate auth code
-		code, err := h.oauthService.CreateAuthCode(r.Context(), clientID, redirectURI, codeChallenge, codeChallengeMethod, resource)
+		code, err := h.oauthService.CreateAuthCode(r.Context(), grant, redirectURI, codeChallenge, codeChallengeMethod)
 		if err != nil {
 			log.Printf("[OAuth] Failed to create auth code: %v", err)
 			redirectWithError(w, r, redirectURI, state, "server_error", "Failed to generate authorization code")
@@ -260,6 +333,17 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 			"error_description": "Invalid client credentials",
 		})
 		return
+	}
+
+	if resource := r.FormValue("resource"); resource != "" {
+		if _, ok := h.resolveResource(resource); !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":             "invalid_target",
+				"error_description": "This server only issues tokens for " + h.resource,
+			})
+			return
+		}
 	}
 
 	switch grantType {
@@ -316,21 +400,113 @@ func (h *Handler) Token(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// computeLoginProof creates an HMAC proving the admin authenticated
-func (h *Handler) computeLoginProof(clientID, redirectURI, codeChallenge, timestamp string) string {
+// computeLoginProof creates an HMAC proving that this person gave the right
+// password for this authorization request. Each field is written with its
+// length, so one set of values can't be read as another.
+func (h *Handler) computeLoginProof(userID, clientID, redirectURI, codeChallenge, resource, timestamp string) string {
 	mac := hmac.New(sha256.New, []byte(h.sessionSecret))
-	mac.Write([]byte(clientID + "|" + redirectURI + "|" + codeChallenge + "|" + timestamp))
+	for _, field := range []string{"lightcms-oauth-consent", userID, clientID, redirectURI, codeChallenge, resource, timestamp} {
+		fmt.Fprintf(mac, "%d:%s", len(field), field)
+	}
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // verifyLoginProof checks the HMAC and ensures it's not expired
-func (h *Handler) verifyLoginProof(clientID, redirectURI, codeChallenge, timestamp, proof string) bool {
+func (h *Handler) verifyLoginProof(userID, clientID, redirectURI, codeChallenge, resource, timestamp, proof string) bool {
 	ts, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil || time.Since(time.Unix(ts, 0)) > loginProofMaxAge {
 		return false
 	}
-	expected := h.computeLoginProof(clientID, redirectURI, codeChallenge, timestamp)
+	expected := h.computeLoginProof(userID, clientID, redirectURI, codeChallenge, resource, timestamp)
 	return hmac.Equal([]byte(expected), []byte(proof))
+}
+
+// approvingUser returns the account behind a verified login proof, or nil if
+// it can no longer connect an app.
+func (h *Handler) approvingUser(r *http.Request, userID string) *models.User {
+	id, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return nil
+	}
+	user, err := h.authManager.GetUserByID(r.Context(), id)
+	if err != nil {
+		log.Printf("[OAuth] Failed to load approving user: %v", err)
+		return nil
+	}
+	if user == nil || user.Disabled || user.IsDefaultPassword {
+		return nil
+	}
+	return user
+}
+
+// resolveResource returns the resource an authorization request is for. A
+// client that names none gets this server's MCP endpoint; naming anything else
+// is refused (RFC 8707).
+func (h *Handler) resolveResource(requested string) (string, bool) {
+	if requested == "" || sameResource(requested, h.resource) {
+		return h.resource, true
+	}
+	return "", false
+}
+
+// sameResource compares two resource URLs, ignoring the differences that don't
+// change what they point at: letter case in the scheme and host, a default
+// port and a trailing slash.
+func sameResource(a, b string) bool {
+	na, okA := normalizeResource(a)
+	nb, okB := normalizeResource(b)
+	return okA && okB && na == nb
+}
+
+func normalizeResource(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if port := u.Port(); port != "" && !(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {
+		host += ":" + port
+	}
+	return scheme + "://" + host + strings.TrimSuffix(u.Path, "/"), true
+}
+
+// cleanClientName removes characters that could disguise a client's name on
+// the consent page (control, zero-width and text-direction characters) and
+// shortens it.
+func cleanClientName(name string) string {
+	name = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, name))
+	if runes := []rune(name); len(runes) > maxClientNameLength {
+		name = string(runes[:maxClientNameLength])
+	}
+	return name
+}
+
+// redirectHost returns the host the browser is sent back to after consent.
+func redirectHost(redirectURI string) string {
+	if u, err := url.Parse(redirectURI); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return redirectURI
+}
+
+// roleSummary says in plain words what a role can do through a connection.
+func roleSummary(role string) string {
+	switch role {
+	case models.RoleAdmin:
+		return "everything an admin can do, including changing site settings, templates and API keys, and publishing"
+	case models.RoleEditor:
+		return "create, edit, delete and publish content, upload assets, and manage forks and approvals"
+	case models.RoleContributor:
+		return "create drafts, upload assets for review, and comment"
+	default:
+		return "read content, templates, assets and settings"
+	}
 }
 
 func (h *Handler) renderAuthorize(w http.ResponseWriter, data map[string]interface{}) {
@@ -389,15 +565,17 @@ func ProtectedResourceMetadataHandler(baseURL string) http.HandlerFunc {
 // AuthorizationServerMetadataHandler returns the RFC 8414 metadata handler
 func AuthorizationServerMetadataHandler(baseURL string) http.HandlerFunc {
 	metadata, _ := json.Marshal(map[string]interface{}{
-		"issuer":                                baseURL,
-		"authorization_endpoint":                baseURL + "/oauth/authorize",
-		"token_endpoint":                        baseURL + "/oauth/token",
-		"registration_endpoint":                 baseURL + "/oauth/register",
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"scopes_supported":                      []string{},
+		"issuer":                                     baseURL,
+		"authorization_endpoint":                     baseURL + "/oauth/authorize",
+		"token_endpoint":                             baseURL + "/oauth/token",
+		"registration_endpoint":                      baseURL + "/oauth/register",
+		"revocation_endpoint":                        baseURL + "/oauth/revoke",
+		"response_types_supported":                   []string{"code"},
+		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
+		"token_endpoint_auth_methods_supported":      []string{"client_secret_post"},
+		"revocation_endpoint_auth_methods_supported": []string{"client_secret_post"},
+		"code_challenge_methods_supported":           []string{"S256"},
+		"scopes_supported":                           []string{},
 	})
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -421,10 +599,36 @@ func JWKSHandler() http.HandlerFunc {
 	}
 }
 
-// TokenRevocationHandler handles token revocation (RFC 7009)
+// TokenRevocation handles token revocation (RFC 7009)
 // POST /oauth/revoke
+//
+// A client can revoke only its own tokens. Revoking a refresh token ends the
+// whole connection. An unknown token still gets a 200, as the RFC requires.
 func (h *Handler) TokenRevocation(w http.ResponseWriter, r *http.Request) {
-	// Per RFC 7009, always return 200 even if token is invalid
+	if err := r.ParseForm(); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "Invalid form data")
+		return
+	}
+
+	clientID := r.FormValue("client_id")
+	if _, err := h.oauthService.ValidateClientCredentials(r.Context(), clientID, r.FormValue("client_secret")); err != nil {
+		jsonError(w, http.StatusUnauthorized, "invalid_client", "Invalid client credentials")
+		return
+	}
+
+	token := r.FormValue("token")
+	if token == "" {
+		jsonError(w, http.StatusBadRequest, "invalid_request", "token is required")
+		return
+	}
+
+	if err := h.oauthService.RevokeToken(r.Context(), clientID, token); err != nil {
+		log.Printf("[OAuth] Token revocation failed: %v", err)
+		jsonError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "Could not revoke the token. Try again.")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "{}")
 }

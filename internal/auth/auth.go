@@ -100,6 +100,11 @@ func (m *Manager) ValidateCredentials(ctx context.Context, email, password strin
 	return m.userService.ValidateCredentials(ctx, email, password)
 }
 
+// GetUserByID returns a user account, or nil if there is none.
+func (m *Manager) GetUserByID(ctx context.Context, id primitive.ObjectID) (*models.User, error) {
+	return m.userService.GetByID(ctx, id)
+}
+
 // ChangePassword updates a user's password via the user service
 func (m *Manager) ChangePassword(ctx context.Context, userID primitive.ObjectID, currentPassword, newPassword string) error {
 	if err := ValidatePasswordStrength(newPassword); err != nil {

@@ -3,6 +3,8 @@ package apiclient
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +30,14 @@ func (c *Client) SetAgentSession(id string) { c.agentSession = id }
 // AgentSession returns the session ID configured via SetAgentSession.
 func (c *Client) AgentSession() string { return c.agentSession }
 
+// NewAgentSessionID returns a new ID for an agent session. The server groups a
+// session's changes under it so they can be reviewed or rolled back as a unit.
+func NewAgentSessionID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b) // never fails: crypto/rand aborts the process instead
+	return "agent-" + time.Now().UTC().Format("20060102-150405") + "-" + hex.EncodeToString(b)
+}
+
 // New creates a new API client
 func New(baseURL, apiKey string) *Client {
 	return &Client{
@@ -35,6 +45,18 @@ func New(baseURL, apiKey string) *Client {
 		apiKey:  apiKey,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
+		},
+	}
+}
+
+// NewWithTransport creates a client that carries no key and sends its requests
+// through transport, which is responsible for saying who the caller is.
+func NewWithTransport(baseURL string, transport http.RoundTripper) *Client {
+	return &Client{
+		baseURL: baseURL,
+		httpClient: &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: transport,
 		},
 	}
 }
@@ -55,7 +77,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 	if c.agentSession != "" {
 		req.Header.Set("X-Agent-Session", c.agentSession)
 	}

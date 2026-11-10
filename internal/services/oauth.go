@@ -6,7 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log"
+	"net"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/database"
@@ -14,13 +19,74 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
 	AccessTokenTTL  = 1 * time.Hour
 	RefreshTokenTTL = 30 * 24 * time.Hour
 	AuthCodeTTL     = 10 * time.Minute
+
+	// RefreshReuseLeeway is how long after a refresh token is rotated a second
+	// use is refused without ending the connection. Two requests from one
+	// client racing to refresh are not an attack; a used token that comes back
+	// later is.
+	RefreshReuseLeeway = 30 * time.Second
+
+	// grantTouchInterval limits how often a grant's last-used time is written.
+	grantTouchInterval = time.Minute
+
+	maxRedirectURILength = 2048
 )
+
+// ErrRefreshTokenReplayed reports that an already-used refresh token was
+// presented, and the connection it belonged to has been revoked.
+var ErrRefreshTokenReplayed = errors.New("refresh token already used; the connection has been revoked")
+
+// MCPResourceURL returns this server's canonical OAuth resource identifier
+// (RFC 8707): the one URL its access tokens are good for.
+func MCPResourceURL(baseURL string) string {
+	return strings.TrimRight(baseURL, "/") + "/mcp"
+}
+
+// ValidateRedirectURI enforces the redirect rules for OAuth clients: https, or
+// http only to a loopback address, where a native app listens on a local port
+// (RFC 8252 section 7.3). No fragments and no embedded credentials.
+func ValidateRedirectURI(raw string) error {
+	if raw == "" || len(raw) > maxRedirectURILength {
+		return fmt.Errorf("redirect_uri must be between 1 and %d characters", maxRedirectURILength)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("redirect_uri must be an absolute URL")
+	}
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		return fmt.Errorf("redirect_uri must not contain a fragment")
+	}
+	if u.User != nil {
+		return fmt.Errorf("redirect_uri must not contain credentials")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("redirect_uri must use https unless it points at this device (localhost)")
+	default:
+		return fmt.Errorf("redirect_uri must use https, or http to localhost")
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 // OAuthService handles OAuth 2.1 authorization
 type OAuthService struct {
@@ -39,6 +105,11 @@ func (s *OAuthService) RegisterClient(ctx context.Context, clientName string, re
 	}
 	if len(redirectURIs) == 0 {
 		return nil, "", fmt.Errorf("redirect_uris is required")
+	}
+	for _, uri := range redirectURIs {
+		if err := ValidateRedirectURI(uri); err != nil {
+			return nil, "", err
+		}
 	}
 
 	clientID, err := generateToken(16)
@@ -93,6 +164,10 @@ func (s *OAuthService) ValidateClient(ctx context.Context, clientID, redirectURI
 	if !found {
 		return nil, fmt.Errorf("redirect_uri not registered")
 	}
+	// Clients registered before these rules existed are held to them too.
+	if err := ValidateRedirectURI(redirectURI); err != nil {
+		return nil, err
+	}
 
 	return &client, nil
 }
@@ -112,8 +187,98 @@ func (s *OAuthService) ValidateClientCredentials(ctx context.Context, clientID, 
 	return &client, nil
 }
 
-// CreateAuthCode generates an authorization code for the given client
-func (s *OAuthService) CreateAuthCode(ctx context.Context, clientID, redirectURI, codeChallenge, codeChallengeMethod, resource string) (string, error) {
+// SaveGrant records that a person approved a client, and returns the grant.
+// One person has one active grant per client: approving again reuses it.
+func (s *OAuthService) SaveGrant(ctx context.Context, client *models.OAuthClient, userID primitive.ObjectID, resource string) (*models.OAuthGrant, error) {
+	now := time.Now()
+	var grant models.OAuthGrant
+	err := s.db.Collection("oauth_grants").FindOneAndUpdate(ctx,
+		bson.M{"client_id": client.ClientID, "user_id": userID, "revoked_at": nil},
+		bson.M{
+			"$set":         bson.M{"client_name": client.ClientName, "resource": resource, "updated_at": now},
+			"$setOnInsert": bson.M{"created_at": now},
+		},
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+	).Decode(&grant)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save grant: %w", err)
+	}
+	return &grant, nil
+}
+
+// GetGrant returns a grant by ID, revoked or not.
+func (s *OAuthService) GetGrant(ctx context.Context, id primitive.ObjectID) (*models.OAuthGrant, error) {
+	var grant models.OAuthGrant
+	if err := s.db.FindOne(ctx, "oauth_grants", bson.M{"_id": id}, &grant); err != nil {
+		return nil, fmt.Errorf("grant not found: %w", err)
+	}
+	return &grant, nil
+}
+
+// activeGrant returns a grant that has not been revoked.
+func (s *OAuthService) activeGrant(ctx context.Context, id primitive.ObjectID) (*models.OAuthGrant, error) {
+	if id.IsZero() {
+		return nil, fmt.Errorf("issued before connections were tied to a person; reconnect the app")
+	}
+	grant, err := s.GetGrant(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if grant.RevokedAt != nil {
+		return nil, fmt.Errorf("connection revoked")
+	}
+	return grant, nil
+}
+
+// RevokeGrant ends a connection: the grant is marked revoked, which alone
+// invalidates everything issued under it, and its tokens are then removed.
+func (s *OAuthService) RevokeGrant(ctx context.Context, id primitive.ObjectID) error {
+	now := time.Now()
+	if err := s.db.UpdateOne(ctx, "oauth_grants",
+		bson.M{"_id": id, "revoked_at": nil},
+		bson.M{"$set": bson.M{"revoked_at": now, "updated_at": now}}); err != nil {
+		return fmt.Errorf("failed to revoke grant: %w", err)
+	}
+	if _, err := s.db.Collection("oauth_refresh_tokens").UpdateMany(ctx,
+		bson.M{"grant_id": id}, bson.M{"$set": bson.M{"revoked": true}}); err != nil {
+		log.Printf("[OAuth] grant %s revoked; marking refresh tokens failed: %v", id.Hex(), err)
+	}
+	if _, err := s.db.DeleteMany(ctx, "oauth_access_tokens", bson.M{"grant_id": id}); err != nil {
+		log.Printf("[OAuth] grant %s revoked; removing access tokens failed: %v", id.Hex(), err)
+	}
+	return nil
+}
+
+// RevokeToken implements RFC 7009 for one client. Revoking a refresh token ends
+// its connection; revoking an access token ends that token alone. A token that
+// is unknown or belongs to another client is ignored, as the RFC requires.
+func (s *OAuthService) RevokeToken(ctx context.Context, clientID, rawToken string) error {
+	tokenHash := hashToken(rawToken)
+
+	var refresh models.OAuthRefreshToken
+	err := s.db.FindOne(ctx, "oauth_refresh_tokens", bson.M{"token_hash": tokenHash}, &refresh)
+	switch {
+	case err == nil:
+		if refresh.ClientID != clientID {
+			return nil
+		}
+		if refresh.GrantID.IsZero() {
+			return s.db.UpdateOne(ctx, "oauth_refresh_tokens", bson.M{"_id": refresh.ID}, bson.M{"$set": bson.M{"revoked": true}})
+		}
+		return s.RevokeGrant(ctx, refresh.GrantID)
+	case !errors.Is(err, mongo.ErrNoDocuments):
+		return fmt.Errorf("looking up refresh token: %w", err)
+	}
+
+	_, err = s.db.DeleteMany(ctx, "oauth_access_tokens", bson.M{"token_hash": tokenHash, "client_id": clientID})
+	if err != nil {
+		return fmt.Errorf("revoking access token: %w", err)
+	}
+	return nil
+}
+
+// CreateAuthCode generates an authorization code under the given grant.
+func (s *OAuthService) CreateAuthCode(ctx context.Context, grant *models.OAuthGrant, redirectURI, codeChallenge, codeChallengeMethod string) (string, error) {
 	rawCode, err := generateToken(32)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate auth code: %w", err)
@@ -122,11 +287,12 @@ func (s *OAuthService) CreateAuthCode(ctx context.Context, clientID, redirectURI
 	now := time.Now()
 	authCode := &models.OAuthAuthCode{
 		CodeHash:            hashToken(rawCode),
-		ClientID:            clientID,
+		ClientID:            grant.ClientID,
+		GrantID:             grant.ID,
 		RedirectURI:         redirectURI,
 		CodeChallenge:       codeChallenge,
 		CodeChallengeMethod: codeChallengeMethod,
-		Resource:            resource,
+		Resource:            grant.Resource,
 		ExpiresAt:           now.Add(AuthCodeTTL),
 		Used:                false,
 		CreatedAt:           now,
@@ -139,7 +305,20 @@ func (s *OAuthService) CreateAuthCode(ctx context.Context, clientID, redirectURI
 	return rawCode, nil
 }
 
-// ExchangeAuthCode validates an auth code and returns access + refresh tokens
+// claim atomically applies update to the one document filter matches, and
+// reports whether this call was the one that changed it.
+func (s *OAuthService) claim(ctx context.Context, collection string, filter, update bson.M) (bool, error) {
+	result, err := s.db.Collection(collection).UpdateOne(ctx, filter, update)
+	if err != nil {
+		return false, err
+	}
+	return result.ModifiedCount == 1, nil
+}
+
+// ExchangeAuthCode validates an auth code and returns access + refresh tokens.
+// The code is consumed atomically, after every check has passed: of two
+// concurrent exchanges exactly one gets tokens, and a failed attempt does not
+// burn the code.
 func (s *OAuthService) ExchangeAuthCode(ctx context.Context, rawCode, clientID, redirectURI, codeVerifier string) (accessToken, refreshToken string, expiresIn int, err error) {
 	codeHash := hashToken(rawCode)
 
@@ -167,19 +346,28 @@ func (s *OAuthService) ExchangeAuthCode(ctx context.Context, rawCode, clientID, 
 		return "", "", 0, fmt.Errorf("PKCE verification failed")
 	}
 
-	// Mark code as used
-	_ = s.db.UpdateOne(ctx, "oauth_auth_codes", bson.M{"_id": authCode.ID}, bson.M{"$set": bson.M{"used": true}})
-
-	// Generate tokens
-	accessToken, refreshToken, expiresIn, err = s.generateTokenPair(ctx, clientID, authCode.Resource)
+	grant, err := s.activeGrant(ctx, authCode.GrantID)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", 0, fmt.Errorf("authorization code: %w", err)
 	}
 
-	return accessToken, refreshToken, expiresIn, nil
+	claimed, err := s.claim(ctx, "oauth_auth_codes",
+		bson.M{"_id": authCode.ID, "used": false},
+		bson.M{"$set": bson.M{"used": true}})
+	if err != nil {
+		return "", "", 0, fmt.Errorf("failed to consume authorization code: %w", err)
+	}
+	if !claimed {
+		return "", "", 0, fmt.Errorf("authorization code already used")
+	}
+
+	return s.generateTokenPair(ctx, grant)
 }
 
-// RefreshAccessToken validates a refresh token and issues new tokens (with rotation)
+// RefreshAccessToken rotates a refresh token and issues new tokens. Rotation is
+// atomic, so one token yields one new pair however many requests race for it.
+// A used token that comes back after RefreshReuseLeeway means two parties hold
+// it, so the connection is revoked and ErrRefreshTokenReplayed returned.
 func (s *OAuthService) RefreshAccessToken(ctx context.Context, rawRefreshToken, clientID string) (newAccessToken, newRefreshToken string, expiresIn int, err error) {
 	tokenHash := hashToken(rawRefreshToken)
 
@@ -188,27 +376,46 @@ func (s *OAuthService) RefreshAccessToken(ctx context.Context, rawRefreshToken, 
 		return "", "", 0, fmt.Errorf("invalid refresh token")
 	}
 
+	if refreshToken.ClientID != clientID {
+		return "", "", 0, fmt.Errorf("client_id mismatch")
+	}
 	if refreshToken.Revoked {
+		if refreshToken.RotatedAt != nil && time.Since(*refreshToken.RotatedAt) > RefreshReuseLeeway && !refreshToken.GrantID.IsZero() {
+			log.Printf("[OAuth] used refresh token replayed; revoking grant %s", refreshToken.GrantID.Hex())
+			if err := s.RevokeGrant(ctx, refreshToken.GrantID); err != nil {
+				log.Printf("[OAuth] revoking grant %s after replay failed: %v", refreshToken.GrantID.Hex(), err)
+			}
+			return "", "", 0, ErrRefreshTokenReplayed
+		}
 		return "", "", 0, fmt.Errorf("refresh token revoked")
 	}
 	if time.Now().After(refreshToken.ExpiresAt) {
 		return "", "", 0, fmt.Errorf("refresh token expired")
 	}
-	if refreshToken.ClientID != clientID {
-		return "", "", 0, fmt.Errorf("client_id mismatch")
+
+	grant, err := s.activeGrant(ctx, refreshToken.GrantID)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("refresh token: %w", err)
 	}
 
-	// Revoke old refresh token (rotation)
-	_ = s.db.UpdateOne(ctx, "oauth_refresh_tokens",
-		bson.M{"_id": refreshToken.ID},
-		bson.M{"$set": bson.M{"revoked": true}})
+	now := time.Now()
+	claimed, err := s.claim(ctx, "oauth_refresh_tokens",
+		bson.M{"_id": refreshToken.ID, "revoked": false},
+		bson.M{"$set": bson.M{"revoked": true, "rotated_at": now}})
+	if err != nil {
+		return "", "", 0, fmt.Errorf("failed to rotate refresh token: %w", err)
+	}
+	if !claimed {
+		return "", "", 0, fmt.Errorf("refresh token revoked")
+	}
 
-	// Generate new token pair
-	return s.generateTokenPair(ctx, clientID, refreshToken.Resource)
+	return s.generateTokenPair(ctx, grant)
 }
 
-// ValidateAccessToken checks a raw access token and returns the token record
-func (s *OAuthService) ValidateAccessToken(ctx context.Context, rawToken string) (*models.OAuthAccessToken, error) {
+// ValidateAccessToken checks a raw access token, for use at the given resource,
+// and returns the live grant it belongs to. A token issued before connections
+// were tied to a person has no grant and is refused.
+func (s *OAuthService) ValidateAccessToken(ctx context.Context, rawToken, resource string) (*models.OAuthGrant, error) {
 	tokenHash := hashToken(rawToken)
 
 	var token models.OAuthAccessToken
@@ -219,12 +426,28 @@ func (s *OAuthService) ValidateAccessToken(ctx context.Context, rawToken string)
 	if time.Now().After(token.ExpiresAt) {
 		return nil, fmt.Errorf("access token expired")
 	}
+	if token.Resource != resource {
+		return nil, fmt.Errorf("access token was not issued for this resource")
+	}
 
-	return &token, nil
+	grant, err := s.activeGrant(ctx, token.GrantID)
+	if err != nil {
+		return nil, fmt.Errorf("access token: %w", err)
+	}
+
+	if grant.LastUsedAt == nil || time.Since(*grant.LastUsedAt) > grantTouchInterval {
+		now := time.Now()
+		if err := s.db.UpdateOne(ctx, "oauth_grants", bson.M{"_id": grant.ID}, bson.M{"$set": bson.M{"last_used_at": now}}); err != nil {
+			log.Printf("[OAuth] recording last use of grant %s failed: %v", grant.ID.Hex(), err)
+		}
+		grant.LastUsedAt = &now
+	}
+
+	return grant, nil
 }
 
 // generateTokenPair creates and stores a new access token + refresh token
-func (s *OAuthService) generateTokenPair(ctx context.Context, clientID, resource string) (string, string, int, error) {
+func (s *OAuthService) generateTokenPair(ctx context.Context, grant *models.OAuthGrant) (string, string, int, error) {
 	rawAccess, err := generateToken(48)
 	if err != nil {
 		return "", "", 0, fmt.Errorf("failed to generate access token: %w", err)
@@ -239,16 +462,18 @@ func (s *OAuthService) generateTokenPair(ctx context.Context, clientID, resource
 
 	accessToken := &models.OAuthAccessToken{
 		TokenHash: hashToken(rawAccess),
-		ClientID:  clientID,
-		Resource:  resource,
+		ClientID:  grant.ClientID,
+		GrantID:   grant.ID,
+		Resource:  grant.Resource,
 		ExpiresAt: now.Add(AccessTokenTTL),
 		CreatedAt: now,
 	}
 
 	refreshToken := &models.OAuthRefreshToken{
 		TokenHash: hashToken(rawRefresh),
-		ClientID:  clientID,
-		Resource:  resource,
+		ClientID:  grant.ClientID,
+		GrantID:   grant.ID,
+		Resource:  grant.Resource,
 		ExpiresAt: now.Add(RefreshTokenTTL),
 		Revoked:   false,
 		CreatedAt: now,
@@ -260,7 +485,7 @@ func (s *OAuthService) generateTokenPair(ctx context.Context, clientID, resource
 
 	if _, err := s.db.InsertOne(ctx, "oauth_refresh_tokens", refreshToken); err != nil {
 		// Clean up the access token we just created
-		_ = s.db.DeleteOne(ctx, "oauth_access_tokens", bson.M{"_id": accessToken.ID})
+		_, _ = s.db.DeleteMany(ctx, "oauth_access_tokens", bson.M{"token_hash": accessToken.TokenHash})
 		return "", "", 0, fmt.Errorf("failed to store refresh token: %w", err)
 	}
 

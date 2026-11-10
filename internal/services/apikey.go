@@ -143,6 +143,17 @@ func (s *APIKeyService) deleteKey(ctx context.Context, filter bson.M) error {
 	return nil
 }
 
+// AssignOwner gives a key with no owner on record to a user. It never changes
+// the owner of a key that already has one.
+func (s *APIKeyService) AssignOwner(ctx context.Context, id, ownerID primitive.ObjectID) error {
+	if err := s.db.UpdateOne(ctx, "api_keys",
+		bson.M{"_id": id, "user_id": nil},
+		bson.M{"$set": bson.M{"user_id": ownerID}}); err != nil {
+		return fmt.Errorf("failed to assign API key owner: %w", err)
+	}
+	return nil
+}
+
 // ValidateAPIKey checks a raw API key, returns the key record if valid, and updates last_used_at
 func (s *APIKeyService) ValidateAPIKey(ctx context.Context, rawKey string) (*models.APIKey, error) {
 	if len(rawKey) < 4 || rawKey[:3] != "lc_" {
