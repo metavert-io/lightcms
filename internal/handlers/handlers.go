@@ -97,6 +97,7 @@ type Handler struct {
 	agentService         *services.AgentService
 	indexNowService      *services.IndexNowService
 	seoService           *services.SEOService
+	oauthService         *services.OAuthService
 }
 
 // SetMaintenanceService wires the maintenance scan service (used by the copilot).
@@ -3290,7 +3291,8 @@ func (h *Handler) APIKeysPage(w http.ResponseWriter, r *http.Request) {
 
 	var keys []models.APIKey
 	var err error
-	if auth.HasPermission(user.Role, auth.PermAPIKeyManageAll) {
+	seeAll := auth.HasPermission(user.Role, auth.PermAPIKeyManageAll)
+	if seeAll {
 		keys, err = h.apiKeyService.ListAPIKeys(r.Context())
 	} else {
 		userID, _ := primitive.ObjectIDFromHex(user.ID)
@@ -3300,8 +3302,23 @@ func (h *Handler) APIKeysPage(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to list API keys: %v", err)
 	}
 
+	cache := map[primitive.ObjectID]*models.User{}
+	rows := make([]credentialRow, 0, len(keys))
+	for i := range keys {
+		row := credentialRow{Key: &keys[i], OwnerEmail: "(no owner)"}
+		if keys[i].UserID != nil {
+			email, ownerCanMerge := h.ownerInfo(r, cache, *keys[i].UserID)
+			row.OwnerEmail = email
+			row.MergeEditable = ownerCanMerge && auth.HasPermission(user.Role, auth.PermForkMerge)
+		}
+		rows = append(rows, row)
+	}
+
 	h.renderAdmin(w, r, "api_keys", map[string]interface{}{
-		"APIKeys": keys,
+		"APIKeys": rows,
+		"SeeAll":  seeAll,
+		"Success": r.URL.Query().Get("success"),
+		"Error":   r.URL.Query().Get("error"),
 	})
 }
 
@@ -3333,14 +3350,27 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// New keys are Sandbox unless Full is chosen. Merging its own forks
+	// needs a role that can merge.
+	access := services.AccessSettings{
+		SandboxOnly:      r.FormValue("access") != "full",
+		CanMergeOwnForks: r.FormValue("can_merge_own_forks") == "1" && auth.HasPermission(user.Role, auth.PermForkMerge),
+	}
 	userID, _ := primitive.ObjectIDFromHex(user.ID)
-	rawKey, apiKey, err := h.apiKeyService.CreateAPIKeyForUser(r.Context(), name, description, &userID)
+	rawKey, apiKey, err := h.apiKeyService.CreateScopedAPIKey(r.Context(), name, description, &userID, nil, access.SandboxOnly)
+	if err == nil && access.CanMergeOwnForks {
+		if err = h.apiKeyService.UpdateAccess(r.Context(), apiKey.ID, access); err == nil {
+			apiKey.CanMergeOwnForks = true
+		}
+	}
 	if err != nil {
 		h.renderAdmin(w, r, "api_key_new", map[string]interface{}{
 			"Error": "Failed to create API key: " + err.Error(),
 		})
 		return
 	}
+	auditDetail(r, "sandbox_only", access.SandboxOnly)
+	auditDetail(r, "can_merge_own_forks", access.CanMergeOwnForks)
 
 	auditResource(r, apiKey.ID.Hex())
 	h.renderAdmin(w, r, "api_key_created", map[string]interface{}{

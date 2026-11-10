@@ -19,7 +19,7 @@ const testResource = "https://example.com/mcp"
 // testGrant records that a new person approved the client.
 func testGrant(t *testing.T, svc *OAuthService, client *models.OAuthClient) *models.OAuthGrant {
 	t.Helper()
-	grant, err := svc.SaveGrant(context.Background(), client, primitive.NewObjectID(), testResource)
+	grant, err := svc.SaveGrant(context.Background(), client, primitive.NewObjectID(), testResource, AccessSettings{})
 	if err != nil {
 		t.Fatalf("SaveGrant: %v", err)
 	}

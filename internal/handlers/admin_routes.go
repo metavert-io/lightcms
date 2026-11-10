@@ -155,6 +155,14 @@ func (h *Handler) AdminRoutes() []AdminRoute {
 		perm("GET", "/api-keys/new", h.NewAPIKeyPage, auth.PermAPIKeyManage),
 		perm("POST", "/api-keys/new", h.CreateAPIKey, auth.PermAPIKeyManage).audited("apikey.create"),
 		perm("POST", "/api-keys/{id}/delete", h.DeleteAPIKey, auth.PermAPIKeyManage).audited("apikey.delete"),
+		perm("POST", "/api-keys/{id}/access", h.UpdateAPIKeyAccess, auth.PermAPIKeyManage).audited("apikey.update"),
+
+		// Connected apps (OAuth connections): everyone manages their own; the
+		// handlers refuse anyone else's below apikey.manage_all, and only a
+		// role that can merge may let an app merge its own forks.
+		session("GET", "/connected-apps", h.ConnectedAppsPage, "lists the signed-in user's own app connections"),
+		session("POST", "/connected-apps/{id}/access", h.UpdateConnectedApp, "changes the signed-in user's own app connection").audited("oauth.update"),
+		session("POST", "/connected-apps/{id}/revoke", h.RevokeConnectedApp, "disconnects the signed-in user's own app").audited("oauth.revoke"),
 
 		// Approvals dashboard
 		perm("GET", "/approvals", h.ApprovalsPage, auth.PermApprovalView),

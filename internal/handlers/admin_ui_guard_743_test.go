@@ -60,7 +60,7 @@ func TestAdminTemplates_DeleteFormsAskFirst(t *testing.T) {
 		t.Fatalf("only %d delete forms found; the scan is not seeing the templates", checked)
 	}
 	for _, want := range []string{
-		`action="/cm/api-keys/{{.ID.Hex}}/delete" style="display:inline;" data-confirm="`,
+		`action="/cm/api-keys/{{.Key.ID.Hex}}/delete" style="display:inline;" data-confirm="`,
 		`action="/cm/snippets/{{.ID.Hex}}/delete" style="display:inline;" data-confirm="`,
 	} {
 		found := false

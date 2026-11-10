@@ -36,6 +36,7 @@ type APIHandler struct {
 	indexNowService     *services.IndexNowService
 	seoService          *services.SEOService
 	analyticsService    *services.AnalyticsService
+	oauthService        *services.OAuthService
 	baseURL             string
 }
 
@@ -92,8 +93,8 @@ func (a *APIHandler) requirePermission(w http.ResponseWriter, r *http.Request, p
 	}
 	if !auth.UserHasPermission(user, perm) {
 		msg := "insufficient permissions"
-		if user.SandboxOnly && auth.HasPermission(user.Role, perm) {
-			msg = "this API key is sandbox-only: live mutations are not permitted — work inside a fork and submit it for human review"
+		if user.Sandboxed() && auth.HasPermission(user.Role, perm) {
+			msg = sandboxRefusalFor(user)
 		}
 		a.jsonError(w, http.StatusForbidden, msg)
 		return false

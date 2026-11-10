@@ -54,7 +54,7 @@ func (f *credentialFixture) accessToken(t *testing.T, user *models.User) (string
 	if err != nil {
 		t.Fatalf("RegisterClient: %v", err)
 	}
-	grant, err := f.oauth.SaveGrant(ctx, client, user.ID, credentialTestResource)
+	grant, err := f.oauth.SaveGrant(ctx, client, user.ID, credentialTestResource, services.AccessSettings{})
 	if err != nil {
 		t.Fatalf("SaveGrant: %v", err)
 	}
@@ -278,5 +278,45 @@ func TestCredentialResolver_ReportsActivity(t *testing.T) {
 	}
 	if seen != user.ID.Hex() {
 		t.Errorf("activity recorded for %q", seen)
+	}
+}
+
+func TestResolver_CarriesAccessSettingsAndOpenSandbox(t *testing.T) {
+	f := newCredentialFixture(t)
+	ctx := context.Background()
+	admin := f.user(t, "admin@example.com", models.RoleAdmin)
+
+	raw, key, _ := f.keys.CreateScopedAPIKey(ctx, "Agent", "", &admin.ID, nil, true)
+	fork := primitive.NewObjectID()
+	if err := f.keys.UpdateAccess(ctx, key.ID, services.AccessSettings{SandboxOnly: true, CanMergeOwnForks: true}); err != nil {
+		t.Fatalf("UpdateAccess: %v", err)
+	}
+	if err := f.keys.SetActiveSandbox(ctx, key.ID, &fork); err != nil {
+		t.Fatalf("SetActiveSandbox: %v", err)
+	}
+	v, err := f.resolver.ResolveAPIKey(ctx, raw)
+	got := caller(t, v, err)
+	if !got.SandboxOnly || !got.CanMergeOwnForks || got.ActiveSandboxFork != fork.Hex() || !got.Sandboxed() {
+		t.Errorf("key caller: %+v", got)
+	}
+
+	token, grant := f.accessToken(t, admin)
+	if err := f.oauth.SetActiveSandbox(ctx, grant.ID, &fork); err != nil {
+		t.Fatalf("SetActiveSandbox: %v", err)
+	}
+	v, err = f.resolver.ResolveOAuthToken(ctx, token)
+	got = caller(t, v, err)
+	if got.SandboxOnly || got.ActiveSandboxFork != fork.Hex() || !got.Sandboxed() {
+		t.Errorf("a Full connection with a sandbox open: %+v", got)
+	}
+	if UserHasPermission(got, PermContentPublish) {
+		t.Error("a caller with a sandbox open may not publish")
+	}
+	if err := f.oauth.SetActiveSandbox(ctx, grant.ID, nil); err != nil {
+		t.Fatalf("SetActiveSandbox(nil): %v", err)
+	}
+	v, err = f.resolver.ResolveOAuthToken(ctx, token)
+	if got = caller(t, v, err); got.Sandboxed() || !UserHasPermission(got, PermContentPublish) {
+		t.Errorf("after the sandbox ended: %+v", got)
 	}
 }

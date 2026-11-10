@@ -54,6 +54,19 @@ func (a *APIHandler) APICreateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A sandboxed caller comments only on pages in its own forks: comments
+	// notify people and go out through webhooks.
+	if a.getAPIUser(r).Sandboxed() {
+		content, err := a.contentService.GetContent(r.Context(), id)
+		if err != nil {
+			a.jsonError(w, http.StatusNotFound, "content not found")
+			return
+		}
+		if !a.callerMayWriteContent(w, r, content) {
+			return
+		}
+	}
+
 	user := a.getAPIUser(r)
 	var (
 		userID      primitive.ObjectID

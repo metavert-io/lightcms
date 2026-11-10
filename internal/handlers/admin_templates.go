@@ -5445,7 +5445,7 @@ var adminTemplates = map[string]string{
         {{if .Error}}<div class="error-message">{{.Error}}</div>{{end}}
         {{if .Success}}<div class="success-message">{{.Success}}</div>{{end}}
 
-        <p class="help-text" style="margin-bottom: 1.5rem;">API keys provide programmatic access to the LightCMS REST API. Use them with the CLI tool, MCP server, or custom integrations.</p>
+        <p class="help-text" style="margin-bottom: 1.5rem;">API keys provide programmatic access to the LightCMS REST API. Use them with the CLI tool, MCP server, or custom integrations. A key acts as its owner, limited by its access: <strong>Sandbox</strong> keys change things only in forks they created, which a person then reviews and merges; <strong>Full</strong> keys can do anything their owner's role can. Only an admin can let a key merge its own forks.</p>
 
         {{if .APIKeys}}
         <div class="table-container">
@@ -5453,8 +5453,9 @@ var adminTemplates = map[string]string{
                 <thead>
                     <tr>
                         <th>Name</th>
-                        <th>Description</th>
+                        {{if .SeeAll}}<th>Owner</th>{{end}}
                         <th>Key Prefix</th>
+                        <th>Access</th>
                         <th>Created</th>
                         <th>Last Used</th>
                         <th></th>
@@ -5463,13 +5464,29 @@ var adminTemplates = map[string]string{
                 <tbody>
                     {{range .APIKeys}}
                     <tr>
-                        <td><strong>{{.Name}}</strong></td>
-                        <td>{{if .Description}}{{.Description}}{{else}}<em>—</em>{{end}}</td>
-                        <td><code>{{.Prefix}}...</code></td>
-                        <td>{{.CreatedAt.Format "Jan 2, 2006"}}</td>
-                        <td>{{if .LastUsedAt}}{{.LastUsedAt.Format "Jan 2, 2006 3:04 PM"}}{{else}}<em>Never</em>{{end}}</td>
+                        <td><strong>{{.Key.Name}}</strong>{{if .Key.Description}}<div class="help-text">{{.Key.Description}}</div>{{end}}</td>
+                        {{if $.SeeAll}}<td>{{.OwnerEmail}}</td>{{end}}
+                        <td><code>{{.Key.Prefix}}...</code></td>
                         <td>
-                            <form method="POST" action="/cm/api-keys/{{.ID.Hex}}/delete" style="display:inline;" data-confirm="Are you sure you want to delete the API key '{{.Name}}'? Any integrations using this key will stop working." data-confirm-title="Delete API Key">
+                            <form method="POST" action="/cm/api-keys/{{.Key.ID.Hex}}/access" class="access-form">
+                                {{$.CSRFField}}
+                                <select name="access" aria-label="Access for {{.Key.Name}}">
+                                    <option value="sandbox"{{if .Key.SandboxOnly}} selected{{end}}>Sandbox</option>
+                                    <option value="full"{{if not .Key.SandboxOnly}} selected{{end}}>Full</option>
+                                </select>
+                                {{if .MergeEditable}}
+                                <input type="hidden" name="merge_shown" value="1">
+                                <label class="inline-check"><input type="checkbox" name="can_merge_own_forks" value="1"{{if .Key.CanMergeOwnForks}} checked{{end}}> Can merge its own forks</label>
+                                {{else if .Key.CanMergeOwnForks}}
+                                <span class="help-text">Can merge its own forks</span>
+                                {{end}}
+                                <button type="submit" class="btn btn-outline btn-sm">Save</button>
+                            </form>
+                        </td>
+                        <td>{{.Key.CreatedAt.Format "Jan 2, 2006"}}</td>
+                        <td>{{if .Key.LastUsedAt}}{{.Key.LastUsedAt.Format "Jan 2, 2006 3:04 PM"}}{{else}}<em>Never</em>{{end}}</td>
+                        <td>
+                            <form method="POST" action="/cm/api-keys/{{.Key.ID.Hex}}/delete" style="display:inline;" data-confirm="Are you sure you want to delete the API key '{{.Key.Name}}'? Any integrations using this key will stop working." data-confirm-title="Delete API Key">
                                 {{$.CSRFField}}
                                 <button type="submit" class="btn btn-danger btn-sm delete-btn">Delete</button>
                             </form>
@@ -5479,9 +5496,82 @@ var adminTemplates = map[string]string{
                 </tbody>
             </table>
         </div>
+        <style>
+            .access-form { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+            .access-form select { width: auto; }
+            .inline-check { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.85rem; margin: 0; }
+        </style>
         {{else}}
         <div class="empty-state">
             <p>No API keys yet. Create one to enable programmatic access.</p>
+        </div>
+        {{end}}
+    ` + adminLayoutEnd,
+
+	"connected_apps": adminLayoutStart + `
+        <div class="page-header">
+            <h1>Connected Apps</h1>
+        </div>
+        {{if .Error}}<div class="error-message">{{.Error}}</div>{{end}}
+        {{if .Success}}<div class="success-message">{{.Success}}</div>{{end}}
+
+        <p class="help-text" style="margin-bottom: 1.5rem;">Apps you connected by signing in (for example an AI assistant using this site's MCP server). Each one acts as the person who connected it, limited by its access: <strong>Sandbox</strong> apps change things only in forks they created, which a person then reviews and merges; <strong>Full</strong> apps can do anything that person's role can. Only an admin can let an app merge its own forks. Disconnecting stops an app at once.</p>
+
+        {{if .Connections}}
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>App</th>
+                        {{if .SeeAll}}<th>Connected by</th>{{end}}
+                        <th>Access</th>
+                        <th>Connected</th>
+                        <th>Last Used</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .Connections}}
+                    <tr>
+                        <td><strong>{{.Grant.ClientName}}</strong></td>
+                        {{if $.SeeAll}}<td>{{.OwnerEmail}}</td>{{end}}
+                        <td>
+                            <form method="POST" action="/cm/connected-apps/{{.Grant.ID.Hex}}/access" class="access-form">
+                                {{$.CSRFField}}
+                                <select name="access" aria-label="Access for {{.Grant.ClientName}}">
+                                    <option value="sandbox"{{if .Grant.SandboxOnly}} selected{{end}}>Sandbox</option>
+                                    <option value="full"{{if not .Grant.SandboxOnly}} selected{{end}}>Full</option>
+                                </select>
+                                {{if .MergeEditable}}
+                                <input type="hidden" name="merge_shown" value="1">
+                                <label class="inline-check"><input type="checkbox" name="can_merge_own_forks" value="1"{{if .Grant.CanMergeOwnForks}} checked{{end}}> Can merge its own forks</label>
+                                {{else if .Grant.CanMergeOwnForks}}
+                                <span class="help-text">Can merge its own forks</span>
+                                {{end}}
+                                <button type="submit" class="btn btn-outline btn-sm">Save</button>
+                            </form>
+                        </td>
+                        <td>{{.Grant.CreatedAt.Format "Jan 2, 2006"}}</td>
+                        <td>{{if .Grant.LastUsedAt}}{{.Grant.LastUsedAt.Format "Jan 2, 2006 3:04 PM"}}{{else}}<em>Never</em>{{end}}</td>
+                        <td>
+                            <form method="POST" action="/cm/connected-apps/{{.Grant.ID.Hex}}/revoke" style="display:inline;" data-confirm="Disconnect '{{.Grant.ClientName}}'? It stops working at once and has to be connected again to come back." data-confirm-title="Disconnect App">
+                                {{$.CSRFField}}
+                                <button type="submit" class="btn btn-danger btn-sm delete-btn">Disconnect</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+        <style>
+            .access-form { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+            .access-form select { width: auto; }
+            .inline-check { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.85rem; margin: 0; }
+        </style>
+        {{else}}
+        <div class="empty-state">
+            <p>No apps are connected.</p>
         </div>
         {{end}}
     ` + adminLayoutEnd,
@@ -5503,12 +5593,24 @@ var adminTemplates = map[string]string{
                     <label for="description">Description</label>
                     <input type="text" id="description" name="description" placeholder="What this key is used for">
                 </div>
+                <div class="form-group">
+                    <label>Access</label>
+                    <label class="inline-choice"><input type="radio" name="access" value="sandbox" checked> <span><strong>Sandbox</strong> (recommended for agents). It can read the site, and it can change things only in forks it creates. Nothing goes live until a person merges them.</span></label>
+                    <label class="inline-choice"><input type="radio" name="access" value="full"> <span><strong>Full</strong>. It can do anything your role can, directly on the live site.</span></label>
+                    {{if index $.Can "fork.merge"}}
+                    <label class="inline-choice"><input type="checkbox" name="can_merge_own_forks" value="1"> <span><strong>Let it merge its own forks.</strong> Its changes then go live without anyone reviewing them first.</span></label>
+                    {{end}}
+                </div>
             </div>
             <div class="form-actions">
                 <a href="/cm/api-keys" class="btn btn-outline">Cancel</a>
                 <button type="submit" class="btn btn-primary">Create API Key</button>
             </div>
         </form>
+        <style>
+            .inline-choice { display: flex; gap: 0.5rem; align-items: flex-start; font-weight: 400; margin: 0.4rem 0; }
+            .inline-choice input { width: auto; margin-top: 0.3rem; }
+        </style>
     ` + adminLayoutEnd,
 
 	"api_key_created": adminLayoutStart + `
@@ -9581,6 +9683,7 @@ const adminLayoutStart = `<!DOCTYPE html>
                     <a href="/cm/redirects" class="nav-link">↪️ Redirects</a>
                     <a href="/cm/config" class="nav-link">⚙️ Configuration</a>
                     <a href="/cm/api-keys" class="nav-link">🔑 API Keys</a>
+                    <a href="/cm/connected-apps" class="nav-link">🔌 Connected Apps</a>
                     <a href="/cm/security" class="nav-link">🔒 Security</a>
                     <a href="/cm/webhooks" class="nav-link">🔔 Webhooks</a>
                     {{if and .CurrentUser (eq .CurrentUser.Role "admin")}}

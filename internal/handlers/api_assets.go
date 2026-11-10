@@ -174,6 +174,9 @@ func (a *APIHandler) APIUploadAsset(w http.ResponseWriter, r *http.Request) {
 		a.jsonError(w, http.StatusBadRequest, "serve_path must begin with /assets/, /images/, /docs/, /media/, or /files/")
 		return
 	}
+	if !a.callerMayUpload(w, r, req.Filename, req.ServePath) {
+		return
+	}
 
 	data, err := base64.StdEncoding.DecodeString(req.DataBase64)
 	if err != nil {
@@ -257,6 +260,28 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Derive filename from URL path if serve_path not provided
+	servePath := req.ServePath
+	if servePath == "" {
+		urlPath := req.URL
+		if idx := strings.Index(urlPath, "?"); idx != -1 {
+			urlPath = urlPath[:idx]
+		}
+		filename := filepath.Base(urlPath)
+		if filename == "" || filename == "." || filename == "/" {
+			filename = "asset"
+		}
+		servePath = "/assets/" + filename
+	}
+	if !isValidAssetServePath(servePath) {
+		a.jsonError(w, http.StatusBadRequest, "serve_path must begin with /assets/, /images/, /docs/, /media/, or /files/")
+		return
+	}
+	filename := filepath.Base(servePath)
+	if !a.callerMayUpload(w, r, filename, servePath) {
+		return
+	}
+
 	// ssrfSafeClient resolves the host and blocks private/reserved IPs before connecting
 	resp, err := ssrfSafeClient.Get(req.URL)
 	if err != nil {
@@ -276,25 +301,6 @@ func (a *APIHandler) APIUploadAssetFromURL(w http.ResponseWriter, r *http.Reques
 		a.jsonError(w, http.StatusBadGateway, "failed to read remote response")
 		return
 	}
-
-	// Derive filename from URL path if serve_path not provided
-	servePath := req.ServePath
-	if servePath == "" {
-		urlPath := req.URL
-		if idx := strings.Index(urlPath, "?"); idx != -1 {
-			urlPath = urlPath[:idx]
-		}
-		filename := filepath.Base(urlPath)
-		if filename == "" || filename == "." || filename == "/" {
-			filename = "asset"
-		}
-		servePath = "/assets/" + filename
-	}
-	if !isValidAssetServePath(servePath) {
-		a.jsonError(w, http.StatusBadRequest, "serve_path must begin with /assets/, /images/, /docs/, /media/, or /files/")
-		return
-	}
-	filename := filepath.Base(servePath)
 
 	asset, err := a.assetService.UploadAsset(r.Context(), data, filename, servePath, req.Description)
 	if err != nil {

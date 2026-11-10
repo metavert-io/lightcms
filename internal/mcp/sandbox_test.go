@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,38 +12,85 @@ import (
 	"github.com/metavert-io/lightcms/v7/internal/apiclient"
 )
 
-// sandboxAPI is a minimal fake REST API tracking fork state, for exercising
-// the agent-sandbox flow end to end at the MCP layer.
+// sandboxAPI is a minimal fake REST API that keeps the sandbox the way the
+// server does: on the credential, outside any MCP session.
 type sandboxAPI struct {
 	mu          sync.Mutex
+	stateStatus int  // when set, GET /api/v1/sandbox answers with this status
+	active      bool // a sandbox is open
+	restricted  bool // the credential is set to Sandbox access
 	forkCreated bool
 	forkDeleted bool
 	forkPages   map[string]string // path -> fork page ID
 	updates     map[string]int    // content ID -> update count
 	diffFails   bool              // when true, the fork diff endpoint returns 500
-	deleteFails bool              // when true, deleting the fork returns 500
+	deleteFails bool              // when true, discarding the sandbox returns 500
+}
+
+func (state *sandboxAPI) sandboxJSON() map[string]interface{} {
+	resp := map[string]interface{}{"active": state.active, "restricted": state.restricted}
+	if state.active {
+		resp["fork_id"] = "fork1"
+		resp["name"] = "agent-session"
+		resp["review_url"] = "/cm/forks/fork1"
+	}
+	return resp
 }
 
 func newSandboxServer(t *testing.T) (*Server, *sandboxAPI, func()) {
 	t.Helper()
 	state := &sandboxAPI{forkPages: map[string]string{}, updates: map[string]int{}}
+	ts := httptest.NewServer(sandboxMux(state))
+	return NewServer(apiclient.New(ts.URL, "test-key")), state, ts.Close
+}
 
+func sandboxMux(state *sandboxAPI) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/forks", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/v1/sandbox", func(w http.ResponseWriter, r *http.Request) {
 		state.mu.Lock()
-		state.forkCreated = true
-		state.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]interface{}{"id": "fork1", "name": "agent-session", "status": "active"})
+		defer state.mu.Unlock()
+		if state.stateStatus != 0 {
+			w.WriteHeader(state.stateStatus)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unavailable"})
+			return
+		}
+		json.NewEncoder(w).Encode(state.sandboxJSON())
 	})
-	mux.HandleFunc("DELETE /api/v1/forks/fork1", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/v1/sandbox", func(w http.ResponseWriter, r *http.Request) {
 		state.mu.Lock()
-		fails := state.deleteFails
-		if !fails {
+		defer state.mu.Unlock()
+		if state.active {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": `a sandbox ("agent-session") is already open; end it first`})
+			return
+		}
+		state.active, state.forkCreated = true, true
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(state.sandboxJSON())
+	})
+	mux.HandleFunc("POST /api/v1/sandbox/end", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if body["action"] == "discard" {
+			if state.deleteFails {
+				http.Error(w, `{"error":"cannot delete"}`, http.StatusInternalServerError)
+				return
+			}
 			state.forkDeleted = true
 		}
+		state.active = false
+		json.NewEncoder(w).Encode(map[string]interface{}{"action": body["action"], "fork_id": "fork1", "restricted": state.restricted})
+	})
+	// The server refuses live changes from a sandboxed caller.
+	mux.HandleFunc("POST /api/v1/content/live1/publish", func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		active := state.active || state.restricted
 		state.mu.Unlock()
-		if fails {
-			http.Error(w, `{"error":"cannot delete"}`, http.StatusInternalServerError)
+		if active {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "this connection is limited to its own forks"})
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
@@ -127,10 +175,7 @@ func newSandboxServer(t *testing.T) (*Server, *sandboxAPI, func()) {
 		})
 	})
 
-	ts := httptest.NewServer(mux)
-	client := apiclient.New(ts.URL, "test-key")
-	s := NewServer(client)
-	return s, state, ts.Close
+	return mux
 }
 
 func TestSandbox_Lifecycle(t *testing.T) {
@@ -151,13 +196,13 @@ func TestSandbox_Lifecycle(t *testing.T) {
 	if !state.forkCreated {
 		t.Fatal("fork was not created")
 	}
-	if _, _, active := s.sandboxFork(); !active {
+	if _, _, active, _ := s.sandboxFork(context.Background()); !active {
 		t.Fatal("sandbox not active after start")
 	}
 
 	// Double-start is refused.
 	res = callTool(t, s, "start_agent_sandbox", map[string]string{})
-	if !strings.Contains(resultText(t, res), "already active") {
+	if !strings.Contains(resultText(t, res), "already open") {
 		t.Errorf("double start: %s", resultText(t, res))
 	}
 
@@ -173,8 +218,48 @@ func TestSandbox_Lifecycle(t *testing.T) {
 	if !strings.Contains(txt, "/cm/forks/fork1") {
 		t.Errorf("submit should include review URL: %s", txt)
 	}
-	if _, _, active := s.sandboxFork(); active {
+	if _, _, active, _ := s.sandboxFork(context.Background()); active {
 		t.Fatal("sandbox still active after submit")
+	}
+}
+
+// The sandbox lives on the server, so a new MCP session (or a restarted
+// server) carries on in the same fork.
+func TestSandbox_ContinuesInANewSession(t *testing.T) {
+	state := &sandboxAPI{forkPages: map[string]string{}, updates: map[string]int{}}
+	ts := httptest.NewServer(sandboxMux(state))
+	defer ts.Close()
+
+	first := NewServer(apiclient.New(ts.URL, "test-key"))
+	callTool(t, first, "start_agent_sandbox", map[string]string{})
+
+	second := NewServer(apiclient.New(ts.URL, "test-key"))
+	if _, _, active, _ := second.sandboxFork(context.Background()); !active {
+		t.Fatal("a new session does not see the open sandbox")
+	}
+	callTool(t, second, "update_content", map[string]interface{}{"id": "live1", "title": "From the new session"})
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.updates["live1"] != 0 || state.updates["fp-live-page"] != 1 {
+		t.Errorf("live=%d fork=%d, want 0/1", state.updates["live1"], state.updates["fp-live-page"])
+	}
+}
+
+func TestSandbox_StatusSaysWhenTheConnectionIsSandboxOnly(t *testing.T) {
+	s, state, cleanup := newSandboxServer(t)
+	defer cleanup()
+	state.restricted = true
+
+	res := callTool(t, s, "get_agent_sandbox", struct{}{})
+	if !strings.Contains(resultText(t, res), "set to Sandbox access") {
+		t.Errorf("status: %s", resultText(t, res))
+	}
+	res = callTool(t, s, "start_agent_sandbox", map[string]string{})
+	callTool(t, s, "end_agent_sandbox", map[string]string{"action": "discard"})
+	res = callTool(t, s, "start_agent_sandbox", map[string]string{})
+	res = callTool(t, s, "end_agent_sandbox", map[string]string{"action": "discard"})
+	if !strings.Contains(resultText(t, res), "can still change only forks") {
+		t.Errorf("discard on a sandbox-only connection: %s", resultText(t, res))
 	}
 }
 
@@ -236,40 +321,19 @@ func TestSandbox_CreateGoesIntoFork(t *testing.T) {
 	}
 }
 
-func TestSandbox_BlocksDestructiveTools(t *testing.T) {
+// Tools no longer refuse anything themselves: the server does, for every
+// client, and its reason reaches the agent.
+func TestSandbox_LiveChangesAreRefusedByTheServer(t *testing.T) {
 	s, _, cleanup := newSandboxServer(t)
 	defer cleanup()
 
+	if res := callTool(t, s, "publish_content", map[string]string{"id": "live1"}); res.IsError {
+		t.Fatalf("without a sandbox: %s", resultText(t, res))
+	}
 	callTool(t, s, "start_agent_sandbox", map[string]string{})
-
-	blocked := []struct {
-		tool string
-		args interface{}
-	}{
-		{"publish_content", map[string]string{"id": "live1"}},
-		{"unpublish_content", map[string]string{"id": "live1"}},
-		{"delete_content", map[string]string{"id": "live1"}},
-		{"restore_content", map[string]string{"id": "live1"}},
-		{"publish_multiple", map[string]interface{}{"ids": []string{"live1"}}},
-		{"bulk_update_content", map[string]interface{}{"updates": []map[string]interface{}{}}},
-		{"bulk_field_operation", map[string]interface{}{"operation": "set", "field": "x"}},
-		{"search_replace_execute", map[string]interface{}{"search": "a", "replace": "b"}},
-		{"scoped_search_replace_execute", map[string]interface{}{"search": "a", "replace": "b"}},
-		{"regenerate_all_content", struct{}{}},
-	}
-	for _, b := range blocked {
-		res := callTool(t, s, b.tool, b.args)
-		if !strings.Contains(resultText(t, res), "BLOCKED") {
-			t.Errorf("%s should be blocked in sandbox, got: %s", b.tool, resultText(t, res))
-		}
-	}
-
-	// Fork tools targeting the sandbox's own fork are blocked too.
-	for _, tool := range []string{"merge_fork", "archive_fork", "delete_fork"} {
-		res := callTool(t, s, tool, map[string]string{"fork_id": "fork1"})
-		if !strings.Contains(resultText(t, res), "BLOCKED") {
-			t.Errorf("%s on own sandbox should be blocked, got: %s", tool, resultText(t, res))
-		}
+	res := callTool(t, s, "publish_content", map[string]string{"id": "live1"})
+	if !res.IsError || !strings.Contains(resultText(t, res), "limited to its own forks") {
+		t.Errorf("publish in a sandbox: %v %s", res.IsError, resultText(t, res))
 	}
 }
 
@@ -285,7 +349,7 @@ func TestSandbox_DiscardDeletesFork(t *testing.T) {
 	if !state.forkDeleted {
 		t.Error("fork was not deleted on discard")
 	}
-	if _, _, active := s.sandboxFork(); active {
+	if _, _, active, _ := s.sandboxFork(context.Background()); active {
 		t.Error("sandbox still active after discard")
 	}
 }
@@ -351,5 +415,29 @@ func TestGovernanceAndMaintenanceTools(t *testing.T) {
 	out = resultText(t, callTool(t, s2, "rollback_agent_session", struct{}{}))
 	if !strings.Contains(out, "no session_id") {
 		t.Errorf("rollback missing session message: %s", out)
+	}
+}
+
+// If the sandbox can't be read, a write stops instead of going to the live
+// page. A server with no sandbox endpoint (before 7.5) has no sandbox.
+func TestSandbox_AFailedCheckStopsTheWrite(t *testing.T) {
+	s, state, cleanup := newSandboxServer(t)
+	defer cleanup()
+
+	state.stateStatus = http.StatusServiceUnavailable
+	res := callTool(t, s, "update_content", map[string]interface{}{"id": "live1", "title": "X"})
+	if !res.IsError || !strings.Contains(resultText(t, res), "could not check") {
+		t.Errorf("update with the sandbox unreadable: %s", resultText(t, res))
+	}
+	state.mu.Lock()
+	writes := state.updates["live1"]
+	state.mu.Unlock()
+	if writes != 0 {
+		t.Error("the write went ahead")
+	}
+
+	state.stateStatus = http.StatusNotFound
+	if res := callTool(t, s, "update_content", map[string]interface{}{"id": "live1", "title": "X"}); res.IsError {
+		t.Errorf("against a server without sandboxes: %s", resultText(t, res))
 	}
 }

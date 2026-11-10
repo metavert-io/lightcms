@@ -135,16 +135,30 @@ type SessionUser struct {
 	ViaOAuth    bool     `json:"via_oauth,omitempty"`    // true when authenticated via an OAuth connection (not session)
 	Credential  string   `json:"credential,omitempty"`   // the API key or OAuth connection in use: "apikey:<id>" or "oauth:<grant id>"
 	Scopes      []string `json:"scopes,omitempty"`       // API-key permission allowlist; empty = full role permissions
-	SandboxOnly bool     `json:"sandbox_only,omitempty"` // API key restricted to fork-sandboxed content writes
+	SandboxOnly bool     `json:"sandbox_only,omitempty"` // key or connection confined to forks it created
+	// CanMergeOwnForks: the key or connection may merge forks it created.
+	CanMergeOwnForks bool `json:"can_merge_own_forks,omitempty"`
+	// ActiveSandboxFork is the fork of the credential's current sandbox
+	// (hex ID), or "" when none is active.
+	ActiveSandboxFork string `json:"active_sandbox_fork,omitempty"`
 }
 
 // CredentialKey implements middleware.CredentialBound.
 func (u *SessionUser) CredentialKey() string { return u.Credential }
 
-// sandboxAllowedPerms is the permission set available to sandbox-only API
-// keys: reading, creating/editing content (fork-scoped, enforced by the
-// content handlers), uploading assets, and working with forks. Everything
-// that mutates the live site directly is excluded.
+// Sandboxed reports whether the caller is confined to forks it created right
+// now: a key or connection set to Sandbox always, and any other while it has a
+// sandbox open.
+func (u *SessionUser) Sandboxed() bool {
+	return u != nil && (u.SandboxOnly || u.ActiveSandboxFork != "")
+}
+
+// sandboxAllowedPerms is the permission set available to a sandboxed caller:
+// reading, creating/editing content (in its own forks, enforced by the
+// content handlers), uploading new non-executable assets, and working with
+// its own forks. Everything that mutates the live site directly is excluded.
+// The REST layer also refuses every write route not listed in
+// handlers.sandboxWriteRoutes.
 var sandboxAllowedPerms = map[string]bool{
 	PermContentView:    true,
 	PermContentCreate:  true,
@@ -166,7 +180,7 @@ func UserHasPermission(u *SessionUser, perm string) bool {
 	if !HasPermission(u.Role, perm) {
 		return false
 	}
-	if u.SandboxOnly && !sandboxAllowedPerms[perm] {
+	if u.Sandboxed() && !sandboxAllowedPerms[perm] {
 		return false
 	}
 	if len(u.Scopes) > 0 {

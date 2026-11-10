@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+// APIError is an error response from the REST API.
+type APIError struct {
+	Status  int
+	Message string
+}
+
+func (e *APIError) Error() string { return e.Message }
+
 // Client is an HTTP client for the LightCMS REST API
 type Client struct {
 	baseURL      string
@@ -103,9 +111,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-			return fmt.Errorf("%s", errResp.Error)
+			return &APIError{Status: resp.StatusCode, Message: errResp.Error}
 		}
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return &APIError{Status: resp.StatusCode, Message: fmt.Sprintf("API error (status %d): %s", resp.StatusCode, string(respBody))}
 	}
 
 	if result != nil {
@@ -1020,6 +1028,46 @@ func (c *Client) GetForkDiff(ctx context.Context, forkID string) (*ForkDiff, err
 		return nil, err
 	}
 	return &result, nil
+}
+
+// SandboxState is the caller's agent sandbox, as the server keeps it on the
+// API key or OAuth connection.
+type SandboxState struct {
+	Active           bool   `json:"active"`
+	Restricted       bool   `json:"restricted"` // the key or connection is set to Sandbox access
+	CanMergeOwnForks bool   `json:"can_merge_own_forks"`
+	ForkID           string `json:"fork_id,omitempty"`
+	Name             string `json:"name,omitempty"`
+	ReviewURL        string `json:"review_url,omitempty"`
+}
+
+// GetSandbox returns the caller's sandbox.
+func (c *Client) GetSandbox(ctx context.Context) (*SandboxState, error) {
+	var result SandboxState
+	if err := c.do(ctx, "GET", "/sandbox", nil, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// StartSandbox opens a sandbox: a new fork that every later request from this
+// key or connection is held to until the sandbox ends.
+func (c *Client) StartSandbox(ctx context.Context, name, description string) (*SandboxState, error) {
+	var result SandboxState
+	if err := c.do(ctx, "POST", "/sandbox", map[string]string{"name": name, "description": description}, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// EndSandbox closes the caller's sandbox: "submit" leaves the fork for
+// review, "discard" deletes it.
+func (c *Client) EndSandbox(ctx context.Context, action string) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	if err := c.do(ctx, "POST", "/sandbox/end", map[string]string{"action": action}, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // GetAgentSessionChanges returns the audit ledger for an agent session.

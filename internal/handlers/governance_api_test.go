@@ -11,12 +11,26 @@ import (
 	"time"
 
 	"github.com/metavert-io/lightcms/v7/internal/auth"
+	"github.com/metavert-io/lightcms/v7/internal/database"
 	"github.com/metavert-io/lightcms/v7/internal/middleware"
 	"github.com/metavert-io/lightcms/v7/internal/models"
 
 	"github.com/gorilla/mux"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+// sandboxTestCredential is the key sandboxOnlyReq signs in with.
+const sandboxTestCredential = "apikey:sandbox-test"
+
+// ownedBySandboxKey records that the sandboxOnlyReq key created the fork, so
+// it may write to it.
+func ownedBySandboxKey(t *testing.T, db *database.DB, forkID primitive.ObjectID) {
+	t.Helper()
+	if err := db.UpdateOne(context.Background(), "content_forks", bson.M{"_id": forkID}, bson.M{"$set": bson.M{"created_by_credential": sandboxTestCredential}}); err != nil {
+		t.Fatalf("ownedBySandboxKey: %v", err)
+	}
+}
 
 // sandboxOnlyReq builds a request authenticated as an admin whose API key is
 // sandbox-only.
@@ -25,6 +39,7 @@ func sandboxOnlyReq(method, target string, body io.Reader) *http.Request {
 	u := &auth.SessionUser{
 		ID: "000000000000000000000001", Email: "agent@localhost",
 		Role: "admin", ViaAPIKey: true, SandboxOnly: true,
+		Credential: sandboxTestCredential,
 	}
 	return req.WithContext(middleware.InjectAPIUser(req.Context(), u))
 }
@@ -35,6 +50,7 @@ func TestSandboxOnlyKey_Enforcement(t *testing.T) {
 
 	tmplID := seedTemplate(t, db, "Page", "page")
 	forkID := createTestFork(t, db, "gov")
+	ownedBySandboxKey(t, db, forkID)
 
 	// Live create without fork_id → 403.
 	req := sandboxOnlyReq("POST", "/api/v1/content", strings.NewReader(
@@ -95,8 +111,8 @@ func TestSandboxOnlyKey_Enforcement(t *testing.T) {
 	if rr.Code != 403 {
 		t.Errorf("publish: status = %d, want 403", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "sandbox-only") {
-		t.Errorf("publish denial should explain sandbox-only, got: %s", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), "limited to its own forks") {
+		t.Errorf("publish denial should explain the sandbox, got: %s", rr.Body.String())
 	}
 
 	// Delete → 403.

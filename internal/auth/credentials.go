@@ -7,6 +7,8 @@ import (
 
 	"github.com/metavert-io/lightcms/v7/internal/models"
 	"github.com/metavert-io/lightcms/v7/internal/services"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // CredentialResolver turns an API key or OAuth access token into the person it
@@ -40,13 +42,15 @@ func (c *CredentialResolver) ResolveAPIKey(ctx context.Context, rawKey string) (
 	}
 	c.recordActivity(owner)
 	return &SessionUser{
-		ID:          owner.ID.Hex(),
-		Email:       owner.Email,
-		Role:        owner.Role,
-		ViaAPIKey:   true,
-		Credential:  "apikey:" + key.ID.Hex(),
-		Scopes:      key.Scopes,
-		SandboxOnly: key.SandboxOnly,
+		ID:                owner.ID.Hex(),
+		Email:             owner.Email,
+		Role:              owner.Role,
+		ViaAPIKey:         true,
+		Credential:        "apikey:" + key.ID.Hex(),
+		Scopes:            key.Scopes,
+		SandboxOnly:       key.SandboxOnly,
+		CanMergeOwnForks:  key.CanMergeOwnForks,
+		ActiveSandboxFork: hexOrEmpty(key.ActiveSandboxFork),
 	}, nil
 }
 
@@ -65,12 +69,22 @@ func (c *CredentialResolver) ResolveOAuthToken(ctx context.Context, rawToken str
 	}
 	c.recordActivity(user)
 	return &SessionUser{
-		ID:         user.ID.Hex(),
-		Email:      user.Email,
-		Role:       user.Role,
-		ViaOAuth:   true,
-		Credential: "oauth:" + grant.ID.Hex(),
+		ID:                user.ID.Hex(),
+		Email:             user.Email,
+		Role:              user.Role,
+		ViaOAuth:          true,
+		Credential:        "oauth:" + grant.ID.Hex(),
+		SandboxOnly:       grant.SandboxOnly,
+		CanMergeOwnForks:  grant.CanMergeOwnForks,
+		ActiveSandboxFork: hexOrEmpty(grant.ActiveSandboxFork),
 	}, nil
+}
+
+func hexOrEmpty(id *primitive.ObjectID) string {
+	if id == nil || id.IsZero() {
+		return ""
+	}
+	return id.Hex()
 }
 
 // keyOwner returns the active user an API key belongs to. A key with no owner

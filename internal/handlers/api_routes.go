@@ -44,6 +44,7 @@ func (a *APIHandler) MountAPI(r *mux.Router, apiAuth *middleware.APIAuth) *mux.R
 	apiv1.Use(middleware.APIRateLimit)      // per-credential sliding-window rate limit (300 req/min)
 	apiv1.Use(middleware.APIBodySizeLimit)  // cap request body at 10 MiB to prevent memory exhaustion
 	apiv1.Use(StampProvenance)
+	apiv1.Use(SandboxGate) // a sandboxed caller can change only its own forks
 
 	// Content
 	apiv1.HandleFunc("/content", a.APIListContent).Methods("GET")
@@ -149,6 +150,11 @@ func (a *APIHandler) MountAPI(r *mux.Router, apiAuth *middleware.APIAuth) *mux.R
 	apiv1.HandleFunc("/forks/{id}/pages", a.APIListForkPages).Methods("GET")
 	apiv1.HandleFunc("/forks/{id}/pages/{pageID}", a.APIRemoveForkPage).Methods("DELETE")
 	apiv1.HandleFunc("/forks/{id}/diff", a.APIForkDiff).Methods("GET")
+
+	// Agent sandbox: a fork the caller's key or connection works in
+	apiv1.HandleFunc("/sandbox", a.APIGetSandbox).Methods("GET")
+	apiv1.HandleFunc("/sandbox", a.APIStartSandbox).Methods("POST")
+	apiv1.HandleFunc("/sandbox/end", a.APIEndSandbox).Methods("POST")
 
 	// Agent session ledger & rollback
 	apiv1.HandleFunc("/agent-sessions/{id}/changes", a.APIAgentSessionChanges).Methods("GET")

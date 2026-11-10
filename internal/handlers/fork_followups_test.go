@@ -100,6 +100,7 @@ func TestAPIContentByPath_ResolvesLivePagesOnly(t *testing.T) {
 
 	tmplID := seedTemplate(t, db, "Page", "page")
 	forkID := createTestFork(t, db, "bp")
+	ownedBySandboxKey(t, db, forkID)
 	otherFork := createTestFork(t, db, "bp-other")
 	// Copies are seeded first so an unfiltered lookup could return them.
 	forkCopy := seedPage(t, db, models.Content{TemplateID: tmplID, Title: "Copy", FullPath: "/bp-page", ForkID: &forkID})

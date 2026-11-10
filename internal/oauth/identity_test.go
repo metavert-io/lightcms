@@ -384,3 +384,74 @@ func TestConsent_ExpiredProofRefused(t *testing.T) {
 		t.Fatal("approved with an expired proof")
 	}
 }
+
+func approveWith(t *testing.T, handler *Handler, oauthSvc *services.OAuthService, users *services.UserService, role string, choices url.Values) *models.OAuthGrant {
+	t.Helper()
+	email := role + "-" + strconv.Itoa(int(time.Now().UnixNano()%1e9)) + "@example.com"
+	user := testAccount(t, users, email, role)
+	client, _, _ := oauthSvc.RegisterClient(context.Background(), "Some App", []string{"http://localhost/cb"})
+	challenge := pkcePair("v")
+	page := signIn(t, handler, client, challenge, email)
+
+	form := authorizeForm(client, challenge, "approve")
+	form.Set("resource", hiddenField(t, page, "resource"))
+	form.Set("login_user", hiddenField(t, page, "login_user"))
+	form.Set("login_proof", hiddenField(t, page, "login_proof"))
+	form.Set("login_ts", hiddenField(t, page, "login_ts"))
+	for k, v := range choices {
+		form[k] = v
+	}
+	if rr := postForm(handler.AuthorizeSubmit, "/oauth/authorize", form); rr.Code != http.StatusFound {
+		t.Fatalf("approve: %d %s", rr.Code, rr.Body.String())
+	}
+	grants, err := oauthSvc.ListGrants(context.Background(), &user.ID)
+	if err != nil || len(grants) != 1 {
+		t.Fatalf("grants for %s: %v %v", email, grants, err)
+	}
+	return &grants[0]
+}
+
+func TestConsent_AccessDefaultsToSandbox(t *testing.T) {
+	handler, oauthSvc, users, cleanup := newTestHandlerWithUsers(t)
+	defer cleanup()
+
+	if grant := approveWith(t, handler, oauthSvc, users, models.RoleEditor, nil); !grant.SandboxOnly || grant.CanMergeOwnForks {
+		t.Errorf("no choice made: %+v", grant)
+	}
+	if grant := approveWith(t, handler, oauthSvc, users, models.RoleEditor, url.Values{"access": {"bogus"}}); !grant.SandboxOnly {
+		t.Errorf("unknown choice: %+v", grant)
+	}
+	if grant := approveWith(t, handler, oauthSvc, users, models.RoleEditor, url.Values{"access": {"full"}}); grant.SandboxOnly {
+		t.Errorf("Full chosen: %+v", grant)
+	}
+}
+
+func TestConsent_OnlyARoleThatCanMergeCanGrantMerging(t *testing.T) {
+	handler, oauthSvc, users, cleanup := newTestHandlerWithUsers(t)
+	defer cleanup()
+	merge := url.Values{"can_merge_own_forks": {"1"}}
+
+	if grant := approveWith(t, handler, oauthSvc, users, models.RoleEditor, merge); grant.CanMergeOwnForks {
+		t.Error("an editor granted merging")
+	}
+	if grant := approveWith(t, handler, oauthSvc, users, models.RoleAdmin, merge); !grant.CanMergeOwnForks || !grant.SandboxOnly {
+		t.Errorf("an admin granting merging on a sandbox connection: %+v", grant)
+	}
+}
+
+func TestConsent_PageOffersMergeOnlyToAdmins(t *testing.T) {
+	handler, oauthSvc, users, cleanup := newTestHandlerWithUsers(t)
+	defer cleanup()
+	testAccount(t, users, "editor@example.com", models.RoleEditor)
+	testAccount(t, users, "admin@example.com", models.RoleAdmin)
+	client, _, _ := oauthSvc.RegisterClient(context.Background(), "Some App", []string{"http://localhost/cb"})
+
+	editorPage := signIn(t, handler, client, pkcePair("v"), "editor@example.com")
+	if !strings.Contains(editorPage, `value="sandbox" checked`) || strings.Contains(editorPage, "can_merge_own_forks") {
+		t.Error("the editor's consent page should default to Sandbox and offer no merge option")
+	}
+	adminPage := signIn(t, handler, client, pkcePair("v"), "admin@example.com")
+	if !strings.Contains(adminPage, "can_merge_own_forks") {
+		t.Error("an admin's consent page should offer the merge option")
+	}
+}
