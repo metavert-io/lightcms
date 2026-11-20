@@ -52,4 +52,3 @@ dist/
 *.test
 *.out
 go.work
-VIBECTL.md
